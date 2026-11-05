@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>IPTV Web Player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.4"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; height: 100vh; overflow: hidden; }
+    #sidebar { width: 360px; background: #1e293b; border-right: 1px solid #334155; display: flex; flex-direction: column; }
+    #header { padding: 16px; border-bottom: 1px solid #334155; }
+    #header h2 { font-size: 18px; margin-bottom: 8px; color: #38bdf8; }
+    #search { width: 100%; padding: 10px 12px; background: #0f172a; border: 1px solid #475569; border-radius: 8px; color: #fff; font-size: 14px; outline: none; }
+    #search:focus { border-color: #38bdf8; }
+    #category-filter { width: 100%; padding: 8px 12px; margin-top: 8px; background: #0f172a; border: 1px solid #475569; border-radius: 8px; color: #fff; font-size: 13px; outline: none; }
+    #dropzone { border: 2px dashed #38bdf8; padding: 12px; text-align: center; font-size: 13px; border-radius: 8px; margin-top: 10px; cursor: pointer; background: rgba(56, 189, 248, 0.05); }
+    #dropzone:hover { background: rgba(56, 189, 248, 0.1); }
+    #channels-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .channel-item { display: flex; align-items: center; padding: 10px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; transition: background 0.15s; }
+    .channel-item:hover { background: #334155; }
+    .channel-item.active { background: #0284c7; color: #fff; }
+    .channel-logo { width: 36px; height: 36px; object-fit: contain; margin-right: 12px; border-radius: 4px; background: rgba(0,0,0,0.2); }
+    .channel-info { flex: 1; min-width: 0; }
+    .channel-name { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .channel-cat { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+    .channel-item.active .channel-cat { color: #e0f2fe; }
+    #main-player { flex: 1; display: flex; flex-direction: column; background: #020617; }
+    #video-container { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; background: #000; }
+    video { width: 100%; height: 100%; max-height: 100%; outline: none; }
+    #player-bar { padding: 16px 24px; background: #0f172a; border-top: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center; }
+    #current-title { font-size: 16px; font-weight: 600; color: #f8fafc; }
+    #stream-url { font-size: 12px; color: #64748b; margin-top: 4px; max-width: 600px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #0284c7; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <div id="header">
+      <h2>📺 IPTV Player</h2>
+      <input type="file" id="file-input" accept=".m3u,.m3u8" style="display: none;">
+      <div id="dropzone" onclick="document.getElementById('file-input').click()">
+        📁 Click to open <b>playlist.m3u</b><br>(or drop the file here)
+      </div>
+      <select id="category-filter" style="display: none;">
+        <option value="">All categories</option>
+      </select>
+      <input type="text" id="search" placeholder="🔍 Search channels..." style="display: none; margin-top: 8px;">
+    </div>
+    <div id="channels-list">
+      <div style="padding: 24px; text-align: center; color: #64748b; font-size: 13px;">
+        Open or drop <b>playlist.m3u</b> from this folder to browse channels
+      </div>
+    </div>
+  </div>
+
+  <div id="main-player">
+    <div id="video-container">
+      <video id="video" controls autoplay></video>
+    </div>
+    <div id="player-bar">
+      <div>
+        <div id="current-title">Pick a channel on the left</div>
+        <div id="stream-url"></div>
+      </div>
+      <span id="status-badge" class="badge" style="display: none;">HLS Live</span>
+    </div>
+  </div>
+
+  <script>
+    const FALLBACK_LOGO = 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36"><rect width="36" height="36" rx="6" fill="#1e293b"/><text x="18" y="23" font-family="sans-serif" font-size="12" fill="#64748b" text-anchor="middle">TV</text></svg>');
+    let allChannels = [];
+    let hls = null;
+    const video = document.getElementById('video');
+    const channelsList = document.getElementById('channels-list');
+    const searchInput = document.getElementById('search');
+    const categoryFilter = document.getElementById('category-filter');
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('file-input');
+    const currentTitle = document.getElementById('current-title');
+    const streamUrl = document.getElementById('stream-url');
+    const statusBadge = document.getElementById('status-badge');
+
+    function parseM3U(text) {
+      const lines = text.split('\n');
+      const channels = [];
+      let currentInfo = null;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line.startsWith('#EXTINF:')) {
+          currentInfo = line;
+        } else if (line && !line.startsWith('#') && currentInfo) {
+          const url = line;
+          const nameMatch = currentInfo.match(/,([^,]+)$/);
+          const name = nameMatch ? nameMatch[1].trim() : 'Untitled';
+          const groupMatch = currentInfo.match(/group-title="([^"]+)"/i);
+          const group = groupMatch ? groupMatch[1].trim() : 'General';
+          const logoMatch = currentInfo.match(/tvg-logo="([^"]+)"/i);
+          const logo = logoMatch ? logoMatch[1].trim() : '';
+
+          channels.push({ name, group, logo, url });
+          currentInfo = null;
+        }
+      }
+      return channels;
+    }
+
+    function initPlaylist(text) {
+      allChannels = parseM3U(text);
+      if (!allChannels.length) {
+        alert('No channels found in this playlist.');
+        return;
+      }
+
+      dropzone.innerHTML = `✅ Channels loaded: <b>${allChannels.length}</b>`;
+      searchInput.style.display = 'block';
+      categoryFilter.style.display = 'block';
+
+      // Fill categories
+      const categories = Array.from(new Set(allChannels.map(c => c.group))).sort();
+      categoryFilter.innerHTML = '<option value="">All categories (' + allChannels.length + ')</option>';
+      categories.forEach(cat => {
+        const count = allChannels.filter(c => c.group === cat).length;
+        const opt = document.createElement('option');
+        opt.value = cat;
+        opt.textContent = `${cat} (${count})`;
+        categoryFilter.appendChild(opt);
+      });
+
+      renderList();
+
+      // Auto play first channel
+      if (allChannels.length > 0) {
+        playChannel(allChannels[0]);
+      }
+    }
+
+    function renderList() {
+      const q = searchInput.value.toLowerCase().trim();
+      const cat = categoryFilter.value;
+
+      const filtered = allChannels.filter(c => {
+        const matchQ = !q || c.name.toLowerCase().includes(q);
+        const matchCat = !cat || c.group === cat;
+        return matchQ && matchCat;
+      });
+
+      channelsList.innerHTML = '';
+      if (!filtered.length) {
+        channelsList.innerHTML = '<div style="padding: 16px; text-align: center; color: #64748b;">Nothing found</div>';
+        return;
+      }
+
+      filtered.forEach((ch, idx) => {
+        const div = document.createElement('div');
+        div.className = 'channel-item';
+        div.onclick = () => playChannel(ch, div);
+
+        const img = document.createElement('img');
+        img.className = 'channel-logo';
+        img.src = ch.logo || FALLBACK_LOGO;
+        img.onerror = () => { img.onerror = null; img.src = FALLBACK_LOGO; };
+
+        const info = document.createElement('div');
+        info.className = 'channel-info';
+
+        const name = document.createElement('div');
+        name.className = 'channel-name';
+        name.textContent = ch.name;
+
+        const group = document.createElement('div');
+        group.className = 'channel-cat';
+        group.textContent = ch.group;
+
+        info.appendChild(name);
+        info.appendChild(group);
+        div.appendChild(img);
+        div.appendChild(info);
+
+        channelsList.appendChild(div);
+      });
+    }
+
+    function playChannel(ch, element) {
+      document.querySelectorAll('.channel-item').forEach(el => el.classList.remove('active'));
+      if (element) element.classList.add('active');
+
+      currentTitle.textContent = ch.name + (ch.group ? ` [${ch.group}]` : '');
+      streamUrl.textContent = ch.url;
+      statusBadge.style.display = 'inline-block';
+
+      if (hls) {
+        hls.destroy();
+      }
+
+      if (Hls.isSupported() && ch.url.includes('.m3u8')) {
+        hls = new Hls({ enableWorker: true, lowLatencyMode: true });
+        hls.loadSource(ch.url);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          if (data.fatal) {
+            console.warn('HLS Fatal error:', data);
+          }
+        });
+      } else {
+        video.src = ch.url;
+        video.play().catch(() => {});
+      }
+    }
+
+    searchInput.addEventListener('input', renderList);
+    categoryFilter.addEventListener('change', renderList);
+
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (evt) => initPlaylist(evt.target.result);
+        reader.readAsText(file);
+      }
+    });
+
+    // Drag & Drop
+    window.addEventListener('dragover', (e) => e.preventDefault());
+    window.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (evt) => initPlaylist(evt.target.result);
+        reader.readAsText(file);
+      }
+    });
+  </script>
+</body>
+</html>

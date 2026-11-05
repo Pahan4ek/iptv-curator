@@ -1,0 +1,61 @@
+{
+  "profile": "balanced",
+  "languages": [
+    "eng",
+    "rus"
+  ],
+  "primary_language": "eng",
+  "min_resolution": "all",
+  "categories": [
+    "News",
+    "Sports",
+    "Movies",
+    "Music",
+    "Animation",
+    "Kids",
+    "Entertainment",
+    "Documentary",
+    "General",
+    "Series",
+    "Comedy"
+  ],
+  "exclude_categories": [
+    "XXX"
+  ],
+  "content_filters": {
+    "enable_antitrash": true,
+    "antitrash_keywords": [
+      "shop",
+      "магазин",
+      "ювелир",
+      "телемагазин",
+      "commercial",
+      "infomercial",
+      "casino",
+      "казино",
+      "лотерея",
+      "религия",
+      "church",
+      "test card"
+    ],
+    "blacklist_keywords": [],
+    "whitelist_keywords": [],
+    "custom_regex": ""
+  },
+  "sources": {
+    "iptv_org": true,
+    "custom_m3u_urls": [],
+    "local_m3u_files": []
+  },
+  "check_streams": true,
+  "deduplicate": true,
+  "max_channels_per_language": {
+    "eng": 200,
+    "rus": 150
+  },
+  "stream_check_timeout_seconds": 4,
+  "max_concurrent_checks": 40,
+  "github_token": "",
+  "gist_id": "",
+  "output_file": "playlist.m3u"
+}
