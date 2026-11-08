@@ -1,7 +1,8 @@
 import asyncio
 import re
 import time
-from typing import Dict, Any, Tuple, Optional
+from typing import Any
+
 import aiohttp
 
 DEFAULT_USER_AGENT = (
@@ -10,7 +11,7 @@ DEFAULT_USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 
-def parse_hls_stream_info(manifest_text: str) -> Dict[str, Any]:
+def parse_hls_stream_info(manifest_text: str) -> dict[str, Any]:
     """
     Parses HLS master manifest for stream quality parameters:
     max resolution (height, width), max bandwidth.
@@ -21,7 +22,7 @@ def parse_hls_stream_info(manifest_text: str) -> Dict[str, Any]:
         "bandwidth": 0,
         "resolution_str": ""
     }
-    
+
     # Match RESOLUTION=1920x1080
     res_matches = re.findall(r'RESOLUTION=(\d+)x(\d+)', manifest_text, re.IGNORECASE)
     for w_str, h_str in res_matches:
@@ -48,10 +49,10 @@ def parse_hls_stream_info(manifest_text: str) -> Dict[str, Any]:
 
 async def check_single_stream(
     session: aiohttp.ClientSession,
-    channel: Dict[str, Any],
-    semaphore: Optional[asyncio.Semaphore] = None,
+    channel: dict[str, Any],
+    semaphore: asyncio.Semaphore | None = None,
     timeout_sec: float = 4.0
-) -> Tuple[bool, float, Dict[str, Any]]:
+) -> tuple[bool, float, dict[str, Any]]:
     """
     Checks if a stream URL is reachable and returns valid media/HLS data.
     Returns (is_alive: bool, latency_ms: float, stream_info: dict).

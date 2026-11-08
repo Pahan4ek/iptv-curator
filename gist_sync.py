@@ -1,17 +1,17 @@
 import json
-import urllib.request
 import urllib.error
-from typing import Optional, Tuple
+import urllib.request
+
 
 class GistSync:
-    def __init__(self, token: str, gist_id: Optional[str] = None):
+    def __init__(self, token: str, gist_id: str | None = None):
         self.token = token.strip() if token else ""
         self.gist_id = gist_id.strip() if gist_id else ""
 
     def is_configured(self) -> bool:
         return bool(self.token)
 
-    def sync_playlist(self, m3u_content: str, filename: str = "playlist.m3u") -> Tuple[bool, str, Optional[str]]:
+    def sync_playlist(self, m3u_content: str, filename: str = "playlist.m3u") -> tuple[bool, str, str | None]:
         """
         Uploads or updates the M3U content in a GitHub Gist.
         Returns (success: bool, direct_raw_url_or_error: str, new_gist_id: Optional[str])
@@ -60,7 +60,7 @@ class GistSync:
                 data = json.loads(resp.read().decode("utf-8"))
                 new_id = data.get("id")
                 owner = data.get("owner", {}).get("login", "")
-                
+
                 # Permanent raw URL without commit SHA
                 if owner and new_id:
                     permanent_raw_url = f"https://gist.githubusercontent.com/{owner}/{new_id}/raw/{filename}"
