@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from checker import parse_hls_stream_info  # noqa: E402
 from iptv_updater import (  # noqa: E402
+    DEFAULT_CONFIG,
     build_m3u,
     deduplicate_channels,
     get_channel_quality_score,
@@ -12,7 +13,6 @@ from iptv_updater import (  # noqa: E402
     normalize_channel_name,
     parse_m3u,
     passes_content_filters,
-    DEFAULT_CONFIG,
 )
 
 SAMPLE_M3U = """#EXTM3U
