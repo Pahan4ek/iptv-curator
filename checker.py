@@ -6,10 +6,9 @@ from typing import Any
 import aiohttp
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
+
 
 def parse_hls_stream_info(manifest_text: str) -> dict[str, Any]:
     """
@@ -20,23 +19,23 @@ def parse_hls_stream_info(manifest_text: str) -> dict[str, Any]:
         "max_height": 0,
         "max_width": 0,
         "bandwidth": 0,
-        "resolution_str": ""
+        "resolution_str": "",
     }
 
     # Match RESOLUTION=1920x1080
-    res_matches = re.findall(r'RESOLUTION=(\d+)x(\d+)', manifest_text, re.IGNORECASE)
+    res_matches = re.findall(r"RESOLUTION=(\d+)x(\d+)", manifest_text, re.IGNORECASE)
     for w_str, h_str in res_matches:
         try:
             w, h = int(w_str), int(h_str)
             if h > info["max_height"]:
                 info["max_height"] = h
                 info["max_width"] = w
-                info["resolution_str"] = f"{h}p" if h not in (2160, 1080, 720) else ("4K" if h >= 2160 else f"{h}p")
+                info["resolution_str"] = "4K" if h >= 2160 else f"{h}p"
         except ValueError:
             continue
 
-    # Match BANDWIDTH=3500000
-    bw_matches = re.findall(r'BANDWIDTH=(\d+)', manifest_text, re.IGNORECASE)
+    # Match BANDWIDTH=3500000 without matching AVERAGE-BANDWIDTH
+    bw_matches = re.findall(r"(?<![A-Z-])BANDWIDTH=(\d+)", manifest_text, re.IGNORECASE)
     for bw_str in bw_matches:
         try:
             bw = int(bw_str)
@@ -47,45 +46,99 @@ def parse_hls_stream_info(manifest_text: str) -> dict[str, Any]:
 
     return info
 
-async def check_single_stream(
+
+def is_mpegts(chunk: bytes) -> bool:
+    """
+    Checks for MPEG-TS sync byte 0x47 repeated every 188 bytes across at least 2-3 packets.
+    Avoids false positives from ASCII strings starting with 'G' (0x47).
+    """
+    if len(chunk) >= 377:
+        return chunk[0] == 0x47 and chunk[188] == 0x47 and chunk[376] == 0x47
+    if len(chunk) >= 189:
+        return chunk[0] == 0x47 and chunk[188] == 0x47
+    return False
+
+
+def is_valid_media_binary(chunk: bytes) -> bool:
+    """
+    Validates known binary media stream signatures and explicitly rejects
+    text, JSON, and HTML error payloads.
+    Supported signatures:
+    - MPEG-TS (sync byte 0x47 with 188-byte stride)
+    - MP4 / ISO BMFF ('ftyp' box)
+    - WebM / MKV (EBML \x1a\x45\xdf\xa3)
+    - FLV (b'FLV')
+    - Ogg (b'OggS')
+    - ADTS / ID3 / MP3 (b'ID3' or sync word 0xFFE0 / 0xFFF0)
+    """
+    if not chunk:
+        return False
+
+    stripped = chunk.lstrip()
+    if (
+        stripped.startswith((b"{", b"[", b"<", b"error", b"Error", b"ERROR"))
+        or b"<html" in stripped.lower()
+        or b"<!doctype" in stripped.lower()
+    ):
+        return False
+
+    if is_mpegts(chunk):
+        return True
+    if len(chunk) >= 8 and (chunk[4:8] == b"ftyp" or b"ftyp" in chunk[:32]):
+        return True
+    if chunk.startswith(b"\x1a\x45\xdf\xa3"):
+        return True
+    if chunk.startswith(b"FLV"):
+        return True
+    if chunk.startswith(b"OggS"):
+        return True
+    if chunk.startswith(b"ID3"):
+        return True
+    return len(chunk) >= 2 and chunk[0] == 0xFF and (chunk[1] & 0xE0) == 0xE0
+
+
+async def _check_single_stream_impl(
     session: aiohttp.ClientSession,
     channel: dict[str, Any],
-    semaphore: asyncio.Semaphore | None = None,
-    timeout_sec: float = 4.0
+    timeout_sec: float = 4.0,
 ) -> tuple[bool, float, dict[str, Any]]:
-    """
-    Checks if a stream URL is reachable and returns valid media/HLS data.
-    Returns (is_alive: bool, latency_ms: float, stream_info: dict).
-    """
     url = channel["url"]
     custom_headers = channel.get("headers", {})
 
     headers = {
-        "User-Agent": custom_headers.get("User-Agent", DEFAULT_USER_AGENT),
-        "Accept": "*/*"
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "*/*",
     }
-    if "Referer" in custom_headers:
-        headers["Referer"] = custom_headers["Referer"]
+    for k, v in custom_headers.items():
+        k_lower = k.lower()
+        if k_lower == "user-agent":
+            headers["User-Agent"] = str(v)
+        elif k_lower in ("referer", "referrer"):
+            headers["Referer"] = str(v)
+        else:
+            headers[k] = str(v)
 
     t0 = time.monotonic()
     stream_info = {
         "max_height": 0,
         "max_width": 0,
         "bandwidth": 0,
-        "resolution_str": ""
+        "resolution_str": "",
     }
 
     try:
         timeout = aiohttp.ClientTimeout(
             total=timeout_sec,
             connect=timeout_sec * 0.7,
-            sock_read=timeout_sec * 0.7
+            sock_read=timeout_sec * 0.7,
         )
         async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as resp:
             if resp.status != 200:
                 return False, 0.0, stream_info
 
             content_type = resp.headers.get("Content-Type", "").lower()
+            if "text/html" in content_type:
+                return False, 0.0, stream_info
 
             # Read first chunk up to 4KB to inspect payload & stream-inf
             chunk = await resp.content.read(4096)
@@ -96,39 +149,55 @@ async def check_single_stream(
             if b"<!doctype html" in lower_chunk or b"<html" in lower_chunk:
                 return False, 0.0, stream_info
 
-            # Inspect HLS Master Manifest
-            if b"#EXT-X-STREAM-INF" in chunk or b"#EXTM3U" in chunk:
-                try:
-                    text_chunk = chunk.decode("utf-8", errors="ignore")
-                    stream_info = parse_hls_stream_info(text_chunk)
-                except Exception:
-                    pass
+            # Check for HLS Master or Media Manifest
+            if b"#EXTM3U" in chunk or b"#EXT-X-STREAM-INF" in chunk:
+                manifest_bytes = chunk
+                remaining = 65536 - len(manifest_bytes)
+                while remaining > 0:
+                    more = await resp.content.read(min(remaining, 8192))
+                    if not more:
+                        break
+                    manifest_bytes += more
+                    remaining -= len(more)
+
+                has_stream_inf = b"#EXT-X-STREAM-INF" in manifest_bytes
+                has_extinf = b"#EXTINF" in manifest_bytes
+
+                if has_stream_inf or has_extinf:
+                    try:
+                        text_manifest = manifest_bytes.decode("utf-8", errors="ignore")
+                        stream_info = parse_hls_stream_info(text_manifest)
+                    except Exception:
+                        pass
+                    return True, latency_ms, stream_info
+
+                return False, 0.0, stream_info
+
+            # HLS segment or media playlist fragment without #EXTM3U
+            if b"#EXTINF" in chunk:
                 return True, latency_ms, stream_info
 
-            # Valid HLS media playlist or version tag
-            if b"#EXT-X-VERSION" in chunk or b"#EXTINF" in chunk:
-                return True, latency_ms, stream_info
-
-            # Valid MPEG-TS (starts with sync byte 0x47)
-            if chunk and chunk[0] == 0x47:
-                return True, latency_ms, stream_info
-
-            # Content-Type matching known media types
-            media_types = [
-                "application/vnd.apple.mpegurl",
-                "application/x-mpegurl",
-                "audio/mpegurl",
-                "video/mp2t",
-                "video/mp4",
-                "video/webm",
-                "audio/aac",
-                "audio/mp3",
-                "application/octet-stream"
-            ]
-            if any(m in content_type for m in media_types) and len(chunk) > 0:
+            # Valid binary media payload (MPEG-TS, MP4, WebM, FLV, Ogg, ADTS/ID3)
+            if is_valid_media_binary(chunk):
                 return True, latency_ms, stream_info
 
             return False, 0.0, stream_info
 
     except Exception:
         return False, 0.0, stream_info
+
+
+async def check_single_stream(
+    session: aiohttp.ClientSession,
+    channel: dict[str, Any],
+    semaphore: asyncio.Semaphore | None = None,
+    timeout_sec: float = 4.0,
+) -> tuple[bool, float, dict[str, Any]]:
+    """
+    Checks if a stream URL is reachable and returns valid media/HLS data.
+    Returns (is_alive: bool, latency_ms: float, stream_info: dict).
+    """
+    if semaphore is not None:
+        async with semaphore:
+            return await _check_single_stream_impl(session, channel, timeout_sec)
+    return await _check_single_stream_impl(session, channel, timeout_sec)
