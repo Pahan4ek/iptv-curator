@@ -55,6 +55,7 @@
   },
   "stream_check_timeout_seconds": 4,
   "max_concurrent_checks": 40,
+  "max_concurrent_per_host": 6,
   "github_token": "",
   "gist_id": "",
   "output_file": "playlist.m3u"

@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from checker import (  # noqa: E402
     DEFAULT_USER_AGENT,
+    CheckResult,
     check_single_stream,
     is_mpegts,
     is_valid_media_binary,
@@ -287,3 +288,109 @@ def test_check_stream_semaphore():
 
     is_alive, latency, info = asyncio.run(run_with_sem())
     assert is_alive is True
+
+
+def test_check_result_dataclass_and_unpacking():
+    res = CheckResult(
+        alive=True,
+        latency_ms=45.2,
+        stream_info={"max_height": 1080},
+        reason="ok",
+        status_code=200,
+    )
+    # Check fields
+    assert res.alive is True
+    assert res.latency_ms == 45.2
+    assert res.stream_info == {"max_height": 1080}
+    assert res.reason == "ok"
+    assert res.status_code == 200
+
+    # Backwards-compatible tuple unpacking (alive, latency, stream_info)
+    alive, latency, info = res
+    assert alive is True
+    assert latency == 45.2
+    assert info == {"max_height": 1080}
+
+    # Indexing
+    assert res[0] is True
+    assert res[1] == 45.2
+    assert res[2] == {"max_height": 1080}
+
+
+def test_check_stream_reasons():
+    channel = {"url": "https://tv.example/live.m3u8"}
+
+    # 403 Forbidden
+    resp_403 = MockStreamResponse(chunks=[], status=403)
+    res = asyncio.run(check_single_stream(MockClientSession(resp_403), channel))
+    assert res.alive is False
+    assert res.reason == "http_403"
+    assert res.status_code == 403
+
+    # 404 Not Found
+    resp_404 = MockStreamResponse(chunks=[], status=404)
+    res = asyncio.run(check_single_stream(MockClientSession(resp_404), channel))
+    assert res.alive is False
+    assert res.reason == "http_404"
+    assert res.status_code == 404
+
+    # 503 Server Error
+    resp_503 = MockStreamResponse(chunks=[], status=503)
+    res = asyncio.run(check_single_stream(MockClientSession(resp_503), channel))
+    assert res.alive is False
+    assert res.reason == "http_5xx"
+    assert res.status_code == 503
+
+    # HTML response
+    resp_html = MockStreamResponse(
+        chunks=[b"<!DOCTYPE html><html><body>Error</body></html>"],
+        status=200,
+        content_type="text/html",
+    )
+    res = asyncio.run(check_single_stream(MockClientSession(resp_html), channel))
+    assert res.alive is False
+    assert res.reason == "html_response"
+
+    # Empty HLS stub
+    resp_empty_hls = MockStreamResponse(
+        chunks=[b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-ENDLIST\n"],
+        status=200,
+        content_type="application/vnd.apple.mpegurl",
+    )
+    res = asyncio.run(check_single_stream(MockClientSession(resp_empty_hls), channel))
+    assert res.alive is False
+    assert res.reason == "empty_hls"
+
+    # Invalid binary / JSON error
+    resp_json = MockStreamResponse(chunks=[b'{"error": "stream offline"}'], status=200)
+    res = asyncio.run(check_single_stream(MockClientSession(resp_json), channel))
+    assert res.alive is False
+    assert res.reason == "invalid_binary"
+
+    # Unsupported URL scheme
+    bad_channel = {"url": "rtmp://tv.example/live"}
+    res = asyncio.run(check_single_stream(MockClientSession(resp_403), bad_channel))
+    assert res.alive is False
+    assert res.reason == "unsupported_scheme"
+
+
+def test_check_stream_timeout_and_network_error():
+    channel = {"url": "https://tv.example/live.m3u8"}
+
+    class TimeoutSession:
+        def get(self, *args, **kwargs):
+            raise asyncio.TimeoutError()
+
+    res = asyncio.run(check_single_stream(TimeoutSession(), channel))
+    assert res.alive is False
+    assert res.reason == "timeout"
+    assert res.status_code is None
+
+    class NetworkErrorSession:
+        def get(self, *args, **kwargs):
+            raise RuntimeError("Connection reset by peer")
+
+    res = asyncio.run(check_single_stream(NetworkErrorSession(), channel))
+    assert res.alive is False
+    assert res.reason == "network_error"
+    assert res.status_code is None

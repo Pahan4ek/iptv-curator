@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
@@ -8,6 +9,28 @@ import aiohttp
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
+
+
+@dataclass
+class CheckResult:
+    """
+    Structured outcome of a single stream probe.
+    Supports backwards-compatible 3-tuple unpacking: (alive, latency_ms, stream_info).
+    """
+
+    alive: bool
+    latency_ms: float = 0.0
+    stream_info: dict[str, Any] = field(default_factory=dict)
+    reason: str = "ok"
+    status_code: int | None = None
+
+    def __iter__(self):
+        yield self.alive
+        yield self.latency_ms
+        yield self.stream_info
+
+    def __getitem__(self, index: int):
+        return (self.alive, self.latency_ms, self.stream_info)[index]
 
 
 def parse_hls_stream_info(manifest_text: str) -> dict[str, Any]:
@@ -101,8 +124,24 @@ async def _check_single_stream_impl(
     session: aiohttp.ClientSession,
     channel: dict[str, Any],
     timeout_sec: float = 4.0,
-) -> tuple[bool, float, dict[str, Any]]:
-    url = channel["url"]
+) -> CheckResult:
+    url = channel.get("url", "")
+    stream_info = {
+        "max_height": 0,
+        "max_width": 0,
+        "bandwidth": 0,
+        "resolution_str": "",
+    }
+
+    if not url.startswith(("http://", "https://")):
+        return CheckResult(
+            alive=False,
+            latency_ms=0.0,
+            stream_info=stream_info,
+            reason="unsupported_scheme",
+            status_code=None,
+        )
+
     custom_headers = channel.get("headers", {})
 
     headers = {
@@ -119,12 +158,6 @@ async def _check_single_stream_impl(
             headers[k] = str(v)
 
     t0 = time.monotonic()
-    stream_info = {
-        "max_height": 0,
-        "max_width": 0,
-        "bandwidth": 0,
-        "resolution_str": "",
-    }
 
     try:
         timeout = aiohttp.ClientTimeout(
@@ -133,12 +166,34 @@ async def _check_single_stream_impl(
             sock_read=timeout_sec * 0.7,
         )
         async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as resp:
-            if resp.status != 200:
-                return False, 0.0, stream_info
+            status_code = resp.status
+            if status_code != 200:
+                if status_code == 403:
+                    reason = "http_403"
+                elif status_code == 404:
+                    reason = "http_404"
+                elif 500 <= status_code < 600:
+                    reason = "http_5xx"
+                else:
+                    reason = f"http_{status_code}"
+
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason=reason,
+                    status_code=status_code,
+                )
 
             content_type = resp.headers.get("Content-Type", "").lower()
             if "text/html" in content_type:
-                return False, 0.0, stream_info
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason="html_response",
+                    status_code=status_code,
+                )
 
             # Read first chunk up to 4KB to inspect payload & stream-inf
             chunk = await resp.content.read(4096)
@@ -147,7 +202,13 @@ async def _check_single_stream_impl(
             # Reject HTML error pages returning HTTP 200
             lower_chunk = chunk.lower()
             if b"<!doctype html" in lower_chunk or b"<html" in lower_chunk:
-                return False, 0.0, stream_info
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason="html_response",
+                    status_code=status_code,
+                )
 
             # Check for HLS Master or Media Manifest
             if b"#EXTM3U" in chunk or b"#EXT-X-STREAM-INF" in chunk:
@@ -169,22 +230,66 @@ async def _check_single_stream_impl(
                         stream_info = parse_hls_stream_info(text_manifest)
                     except Exception:
                         pass
-                    return True, latency_ms, stream_info
+                    return CheckResult(
+                        alive=True,
+                        latency_ms=latency_ms,
+                        stream_info=stream_info,
+                        reason="ok",
+                        status_code=status_code,
+                    )
 
-                return False, 0.0, stream_info
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason="empty_hls",
+                    status_code=status_code,
+                )
 
             # HLS segment or media playlist fragment without #EXTM3U
             if b"#EXTINF" in chunk:
-                return True, latency_ms, stream_info
+                return CheckResult(
+                    alive=True,
+                    latency_ms=latency_ms,
+                    stream_info=stream_info,
+                    reason="ok",
+                    status_code=status_code,
+                )
 
             # Valid binary media payload (MPEG-TS, MP4, WebM, FLV, Ogg, ADTS/ID3)
             if is_valid_media_binary(chunk):
-                return True, latency_ms, stream_info
+                return CheckResult(
+                    alive=True,
+                    latency_ms=latency_ms,
+                    stream_info=stream_info,
+                    reason="ok",
+                    status_code=status_code,
+                )
 
-            return False, 0.0, stream_info
+            return CheckResult(
+                alive=False,
+                latency_ms=0.0,
+                stream_info=stream_info,
+                reason="invalid_binary",
+                status_code=status_code,
+            )
 
+    except (asyncio.TimeoutError, TimeoutError):
+        return CheckResult(
+            alive=False,
+            latency_ms=0.0,
+            stream_info=stream_info,
+            reason="timeout",
+            status_code=None,
+        )
     except Exception:
-        return False, 0.0, stream_info
+        return CheckResult(
+            alive=False,
+            latency_ms=0.0,
+            stream_info=stream_info,
+            reason="network_error",
+            status_code=None,
+        )
 
 
 async def check_single_stream(
@@ -192,10 +297,10 @@ async def check_single_stream(
     channel: dict[str, Any],
     semaphore: asyncio.Semaphore | None = None,
     timeout_sec: float = 4.0,
-) -> tuple[bool, float, dict[str, Any]]:
+) -> CheckResult:
     """
     Checks if a stream URL is reachable and returns valid media/HLS data.
-    Returns (is_alive: bool, latency_ms: float, stream_info: dict).
+    Returns CheckResult(alive, latency_ms, stream_info, reason, status_code).
     """
     if semaphore is not None:
         async with semaphore:
