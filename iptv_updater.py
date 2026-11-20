@@ -72,6 +72,7 @@ DEFAULT_CONFIG = {
     "check_streams": True,
     "stream_check_timeout_seconds": 4.0,
     "max_concurrent_checks": 40,
+    "max_concurrent_per_host": 6,
 
     # Output & Gist sync
     "github_token": "",  # prefer the GITHUB_TOKEN env var
@@ -424,9 +425,24 @@ async def fetch_playlist(session: aiohttp.ClientSession, url: str, lang: str = "
         print(f"[!] Error fetching {url}: {e}")
     return []
 
-async def check_all_streams(channels: list[dict[str, Any]], cfg: dict) -> list[dict[str, Any]]:
-    concurrency = min(cfg.get("max_concurrent_checks", 40), 60)
-    timeout = cfg.get("stream_check_timeout_seconds", 4.0)
+async def check_all_streams(
+    channels: list[dict[str, Any]],
+    cfg: dict,
+    summary_out: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        raw_concurrency = int(cfg.get("max_concurrent_checks", 40))
+    except (ValueError, TypeError):
+        raw_concurrency = 40
+    concurrency = max(1, raw_concurrency)
+
+    try:
+        raw_limit_per_host = int(cfg.get("max_concurrent_per_host", 6))
+    except (ValueError, TypeError):
+        raw_limit_per_host = 6
+    limit_per_host = max(1, raw_limit_per_host)
+
+    timeout = float(cfg.get("stream_check_timeout_seconds", 4.0))
 
     total = len(channels)
     print(f"\n[*] Checking streams ({total} channels, concurrency {concurrency}, timeout {timeout}s)...")
@@ -438,10 +454,17 @@ async def check_all_streams(channels: list[dict[str, Any]], cfg: dict) -> list[d
     resolver = aiohttp.ThreadedResolver()
     # ssl=False on purpose: lots of free IPTV origins run expired/self-signed certs,
     # and we only read the first 4 KB of a public stream here, nothing sensitive is sent.
-    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False, limit=concurrency, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(
+        resolver=resolver,
+        ssl=False,
+        limit=concurrency,
+        limit_per_host=limit_per_host,
+        ttl_dns_cache=300,
+    )
 
     tested = 0
     alive_channels = []
+    drop_reasons: dict[str, int] = {}
     t_start = time.time()
     lock = asyncio.Lock()
 
@@ -454,23 +477,27 @@ async def check_all_streams(channels: list[dict[str, Any]], cfg: dict) -> list[d
                 except asyncio.QueueEmpty:
                     break
                 try:
-                    is_alive, latency, stream_info = await check_single_stream(session, ch, timeout_sec=timeout)
+                    res = await check_single_stream(session, ch, timeout_sec=timeout)
                     async with lock:
                         tested += 1
+                        if res.alive:
+                            ch["latency"] = res.latency_ms
+                            if res.stream_info.get("max_height"):
+                                ch["detected_height"] = res.stream_info["max_height"]
+                            if res.stream_info.get("bandwidth"):
+                                ch["bandwidth"] = res.stream_info["bandwidth"]
+                            alive_channels.append(ch)
+                        else:
+                            drop_reasons[res.reason] = drop_reasons.get(res.reason, 0) + 1
+
                         if tested % 25 == 0 or tested == total:
                             percent = (tested / total) * 100
                             print(f"\r  -> Checked: {tested}/{total} ({percent:.1f}%) | alive: {len(alive_channels)}",
                                   end="", flush=True)
-                        if is_alive:
-                            ch["latency"] = latency
-                            if stream_info.get("max_height"):
-                                ch["detected_height"] = stream_info["max_height"]
-                            if stream_info.get("bandwidth"):
-                                ch["bandwidth"] = stream_info["bandwidth"]
-                            alive_channels.append(ch)
                 except Exception:
                     async with lock:
                         tested += 1
+                        drop_reasons["network_error"] = drop_reasons.get("network_error", 0) + 1
                 finally:
                     queue.task_done()
 
@@ -479,6 +506,20 @@ async def check_all_streams(channels: list[dict[str, Any]], cfg: dict) -> list[d
 
     duration = time.time() - t_start
     print(f"\n[+] Done in {duration:.1f}s: {len(alive_channels)} of {total} streams alive.\n")
+
+    failures = {k: v for k, v in drop_reasons.items() if k != "ok"}
+    if failures:
+        top_failures = sorted(failures.items(), key=lambda item: item[1], reverse=True)[:5]
+        summary_str = ", ".join(f"{reason}: {count}" for reason, count in top_failures)
+        print(f"[*] Top failure reasons: {summary_str}\n")
+
+    if summary_out is not None:
+        summary_out["total"] = total
+        summary_out["alive"] = len(alive_channels)
+        summary_out["dropped"] = total - len(alive_channels)
+        summary_out["duration_seconds"] = round(duration, 2)
+        summary_out["drop_reasons"] = dict(drop_reasons)
+
     return alive_channels
 
 def deduplicate_channels(channels: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -602,6 +643,7 @@ def parse_args():
     parser.add_argument("--min-res", choices=["all", "720p", "1080p", "4k"], help="Minimum resolution filter")
     parser.add_argument("--no-check", action="store_true", help="Skip online stream checks (faster)")
     parser.add_argument("--no-antitrash", action="store_true", help="Disable anti-trash keyword filter")
+    parser.add_argument("--summary-json", help="Path to write run summary/diagnostics JSON file")
     return parser.parse_args()
 
 async def main():
@@ -619,6 +661,8 @@ async def main():
         cfg["check_streams"] = False
     if args.no_antitrash:
         cfg["content_filters"]["enable_antitrash"] = False
+    if args.summary_json:
+        cfg["summary_json"] = args.summary_json
 
     profile_name = cfg.get("profile", "balanced")
     if profile_name in PRESETS:
@@ -725,18 +769,41 @@ async def main():
                 all_channels.append(ch4k)
 
     print(f"\n[+] Candidates: {len(all_channels)} (dropped by anti-trash/blacklist: {trash_count})")
+    summary_path = (cfg.get("summary_json") or getattr(args, "summary_json", None) or "").strip()
+    check_stats: dict[str, Any] = {}
+
+    def write_summary_json(final_count: int, alive_count: int):
+        if not summary_path:
+            return
+        summary_data = {
+            "total_candidates": len(all_channels),
+            "alive_streams": alive_count,
+            "dropped_streams": len(all_channels) - alive_count,
+            "check_duration_seconds": check_stats.get("duration_seconds", 0.0),
+            "drop_reasons": check_stats.get("drop_reasons", {}),
+            "final_channels_count": final_count,
+        }
+        try:
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary_data, f, indent=2, ensure_ascii=False)
+            print(f"[+] Summary JSON saved: {os.path.abspath(summary_path)}")
+        except Exception as e:
+            print(f"[!] Failed to save summary JSON to {summary_path}: {e}")
+
     if not all_channels:
+        write_summary_json(0, 0)
         print("[!] No channels match the current filters.")
         return
 
     # 2. Check stream availability & probe HLS resolution
     if cfg.get("check_streams", True):
-        working_channels = await check_all_streams(all_channels, cfg)
+        working_channels = await check_all_streams(all_channels, cfg, summary_out=check_stats)
     else:
         print("[*] Stream check skipped (--no-check).")
         working_channels = all_channels
 
     if not working_channels:
+        write_summary_json(0, 0)
         print("[!] No stream passed the check.")
         return
 
@@ -805,6 +872,8 @@ async def main():
             print(f"[!] Gist error: {url_or_err}")
     else:
         print("\n[*] Gist sync not configured, playlist is local only.")
+
+    write_summary_json(len(final_channels), len(working_channels))
 
 if __name__ == "__main__":
     asyncio.run(main())
