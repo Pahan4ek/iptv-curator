@@ -112,8 +112,13 @@ def test_content_filters():
 def test_build_m3u_roundtrip_and_order():
     chans = parse_m3u(SAMPLE_M3U, lang="eng")
     uhd = {
-        "name": "NASA TV UHD", "lang": "uhd", "url": "https://example.com/nasa.m3u8",
-        "tvg_id": "", "tvg_logo": "", "raw_group": "Documentary", "headers": {},
+        "name": "NASA TV UHD",
+        "lang": "uhd",
+        "url": "https://example.com/nasa.m3u8",
+        "tvg_id": "",
+        "tvg_logo": "",
+        "raw_group": "Documentary",
+        "headers": {},
     }
     text = build_m3u(chans + [uhd])
     assert text.startswith("#EXTM3U")

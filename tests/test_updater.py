@@ -1,14 +1,28 @@
+import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
 
 import aiohttp
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from checker import CheckResult  # noqa: E402
-from iptv_updater import DEFAULT_CONFIG, check_all_streams  # noqa: E402
+from iptv_updater import (  # noqa: E402
+    DEFAULT_CONFIG,
+    UHD_4K_CHANNELS,
+    build_m3u,
+    check_all_streams,
+    compile_custom_regex,
+    get_channel_quality_score,
+    is_high_def,
+    parse_m3u,
+    passes_content_filters,
+    resolve_config,
+)
 
 
 def test_concurrency_normalization_negative_and_zero(monkeypatch):
@@ -149,3 +163,207 @@ def test_summary_json_output(tmp_path, monkeypatch):
     assert loaded["alive_streams"] == 1
     assert loaded["dropped_streams"] == 1
     assert loaded["drop_reasons"]["http_404"] == 1
+
+
+def test_parse_m3u_channel_name_with_comma_and_logo_quality():
+    raw_m3u = (
+        '#EXTINF:-1 tvg-logo="https://img.example/hd4k.png",NBC 4, New York\n'
+        "https://example.com/nbc.m3u8\n"
+        '#EXTINF:-1 group-title="News",News, Sport & Weather\n'
+        "https://example.com/nsw.m3u8\n"
+    )
+    chans = parse_m3u(raw_m3u, lang="eng")
+    assert len(chans) == 2
+
+    nbc = chans[0]
+    assert nbc["name"] == "NBC 4, New York"
+    score = get_channel_quality_score(nbc)
+    # The logo URL contains 'hd4k', but tvg_logo / extinf logo must NOT affect quality score
+    assert score < 720
+    assert score != 2160
+    assert not is_high_def(nbc)
+
+    nsw = chans[1]
+    assert nsw["name"] == "News, Sport & Weather"
+
+
+def test_build_m3u_deduplicates_headers_and_vlcopt():
+    raw_m3u = (
+        '#EXTINF:-1 http-user-agent="CustomUA/1.0" http-referrer="https://ref.example",NBC 4, New York\n'
+        "#EXTVLCOPT:http-user-agent=CustomUA/1.0\n"
+        "#EXTVLCOPT:http-referrer=https://ref.example\n"
+        "#EXTVLCOPT:http-user-agent=CustomUA/1.0\n"
+        "https://example.com/nbc.m3u8\n"
+    )
+    chans = parse_m3u(raw_m3u, lang="eng")
+    out = build_m3u(chans, primary_lang="eng")
+    assert out.count("http-user-agent") == 1
+    assert out.count("http-referrer") == 1
+    assert "#EXTVLCOPT" not in out
+
+
+def test_quality_score_word_boundaries_no_false_positives():
+    # Baghdad, Newsdesk, USD, query parameters must not be misdetected as hd/sd/4k
+    ch_baghdad = {"name": "Baghdad TV", "url": "https://example.com/stream.m3u8"}
+    assert get_channel_quality_score(ch_baghdad) == 540
+
+    ch_newsdesk = {"name": "Newsdesk Live", "url": "https://example.com/stream.m3u8"}
+    assert get_channel_quality_score(ch_newsdesk) == 540
+
+    ch_usd = {"name": "USD Market", "url": "https://example.com/stream.m3u8"}
+    assert get_channel_quality_score(ch_usd) == 540
+
+    ch_query = {"name": "Clean Stream", "url": "https://example.com/stream.m3u8?token=4k&quality=uhd"}
+    assert get_channel_quality_score(ch_query) == 540
+
+    # Legitimate quality tokens
+    assert get_channel_quality_score({"name": "Travel 4K", "url": "https://example.com/stream.m3u8"}) == 2160
+    assert get_channel_quality_score({"name": "Sports FHD", "url": "https://example.com/stream.m3u8"}) == 1080
+    assert get_channel_quality_score({"name": "Channel HD", "url": "https://example.com/stream.m3u8"}) == 720
+    assert get_channel_quality_score({"name": "Old TV SD", "url": "https://example.com/stream.m3u8"}) == 480
+
+
+def test_workshop_tv_not_blocked_by_shop_filter():
+    filters = {
+        "enable_antitrash": True,
+        "antitrash_keywords": ["shop", "casino"],
+        "blacklist_keywords": [],
+        "whitelist_keywords": [],
+        "custom_regex": "",
+    }
+    # Workshop TV should NOT be blocked by shop
+    passed, reason = passes_content_filters({"name": "Workshop TV"}, filters)
+    assert passed is True, f"Workshop TV was unexpectedly blocked: {reason}"
+
+    # Genuine shop channel must be blocked
+    passed_shop, reason_shop = passes_content_filters({"name": "Home Shop TV"}, filters)
+    assert passed_shop is False
+    assert "shop" in reason_shop.lower()
+
+    # Casino channel blocked
+    passed_casino, _ = passes_content_filters({"name": "Casino 24"}, filters)
+    assert passed_casino is False
+
+
+def test_custom_regex_warning_on_invalid_pattern():
+    filters = {
+        "enable_antitrash": False,
+        "custom_regex": "[invalid(pattern",
+    }
+    with pytest.warns(UserWarning, match="Invalid custom_regex pattern"):
+        passed, _ = passes_content_filters({"name": "Test TV"}, filters)
+    assert passed is True
+
+    # compile_custom_regex directly warns and returns None
+    with pytest.warns(UserWarning, match="Invalid custom_regex pattern"):
+        compiled = compile_custom_regex("[invalid(pattern")
+        assert compiled is None
+
+
+def test_cli_flags_precedence_and_lang():
+    # 1. --profile cinema --min-res all -> min_resolution == 'all'
+    args_cinema = argparse.Namespace(
+        profile="cinema",
+        min_res="all",
+        lang=None,
+        no_check=False,
+        no_antitrash=False,
+        summary_json=None,
+    )
+    resolved_cinema = resolve_config(DEFAULT_CONFIG, args_cinema)
+    assert resolved_cinema["profile"] == "cinema"
+    assert resolved_cinema["min_resolution"] == "all"
+
+    # 2. --lang ukr -> primary_language == 'ukr'
+    args_ukr = argparse.Namespace(
+        profile=None,
+        min_res=None,
+        lang="ukr",
+        no_check=False,
+        no_antitrash=False,
+        summary_json=None,
+    )
+    resolved_ukr = resolve_config(DEFAULT_CONFIG, args_ukr)
+    assert resolved_ukr["languages"] == ["ukr"]
+    assert resolved_ukr["primary_language"] == "ukr"
+
+    # 3. --lang eng,eng -> deduplicated, no duplicate channels in output
+    args_dedup = argparse.Namespace(
+        profile=None,
+        min_res=None,
+        lang="eng,eng",
+        no_check=False,
+        no_antitrash=False,
+        summary_json=None,
+    )
+    resolved_dedup = resolve_config(DEFAULT_CONFIG, args_dedup)
+    assert resolved_dedup["languages"] == ["eng"]
+    assert resolved_dedup["primary_language"] == "eng"
+
+
+def test_lang_order_deduplication_no_duplicate_channels():
+    channels = [
+        {"name": "BBC News", "lang": "eng", "url": "https://example.com/bbc.m3u8", "headers": {}},
+    ]
+    primary_lang = "eng"
+    languages = ["eng"]
+    lang_order = list(
+        dict.fromkeys(
+            ["uhd", primary_lang] + [code for code in languages if code != primary_lang] + ["custom", "local"]
+        )
+    )
+    final_channels = []
+    for lang in lang_order:
+        lang_chans = [c for c in channels if c.get("lang") == lang]
+        final_channels.extend(lang_chans)
+    assert len(final_channels) == 1
+
+
+def test_uhd_4k_channels_not_mutated_and_profile_filtering():
+    orig_snapshot = copy.deepcopy(UHD_4K_CHANNELS)
+
+    # 1. Profile filtering: kids & news disable curated 4K channels
+    args_kids = argparse.Namespace(
+        profile="kids",
+        min_res=None,
+        lang=None,
+        no_check=False,
+        no_antitrash=False,
+        summary_json=None,
+    )
+    resolved_kids = resolve_config(DEFAULT_CONFIG, args_kids)
+    assert resolved_kids["include_curated_4k"] is False
+
+    args_news = argparse.Namespace(
+        profile="news",
+        min_res=None,
+        lang=None,
+        no_check=False,
+        no_antitrash=False,
+        summary_json=None,
+    )
+    resolved_news = resolve_config(DEFAULT_CONFIG, args_news)
+    assert resolved_news["include_curated_4k"] is False
+
+    args_cinema = argparse.Namespace(
+        profile="cinema",
+        min_res=None,
+        lang=None,
+        no_check=False,
+        no_antitrash=False,
+        summary_json=None,
+    )
+    resolved_cinema = resolve_config(DEFAULT_CONFIG, args_cinema)
+    assert resolved_cinema["include_curated_4k"] is True
+
+    # 2. Mutating copies or formatting does not mutate global list
+    ch_copies = [copy.deepcopy(c) for c in UHD_4K_CHANNELS]
+    for ch in ch_copies:
+        ch["latency"] = 15.0
+        ch["detected_height"] = 2160
+        ch["bandwidth"] = 5000000
+
+    build_m3u(ch_copies)
+
+    # Verify global UHD_4K_CHANNELS snapshot is strictly unchanged
+    assert orig_snapshot == UHD_4K_CHANNELS

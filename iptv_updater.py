@@ -1,11 +1,13 @@
 import argparse
 import asyncio
 import copy
+import functools
 import json
 import os
 import re
 import sys
 import time
+import warnings
 from typing import Any
 
 import aiohttp
@@ -15,98 +17,127 @@ from gist_sync import GistSync
 
 try:
     if sys.platform == "win32":
-        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
+RE_QUALITY_4K = re.compile(r"\b(4k|2160p|uhd)\b", re.IGNORECASE)
+RE_QUALITY_1080 = re.compile(r"\b(1080p|fhd)\b", re.IGNORECASE)
+RE_QUALITY_720 = re.compile(r"\b(720p|hd)\b", re.IGNORECASE)
+RE_QUALITY_576 = re.compile(r"\b576p\b", re.IGNORECASE)
+RE_QUALITY_480 = re.compile(r"\b(480p|sd)\b", re.IGNORECASE)
+
+_INVALID_REGEX = object()
+
 DEFAULT_CONFIG = {
     # Active profile: "balanced", "cinema", "sports", "kids", "news", "custom"
     "profile": "balanced",
-
     # Target languages: English is primary, Russian is included
     "languages": ["eng", "rus"],
     "primary_language": "eng",
-
     # Source settings
-    "sources": {
-        "iptv_org": True,
-        "custom_m3u_urls": [],
-        "local_m3u_files": []
-    },
-
+    "sources": {"iptv_org": True, "custom_m3u_urls": [], "local_m3u_files": []},
     # Resolution & quality filter: "all", "720p", "1080p", "4k"
     "min_resolution": "all",
-
     # Deduplicate channels and pick highest resolution/bitrate
     "deduplicate": True,
-
     # Categories filter
     "categories": [
-        "News", "Sports", "Movies", "Music", "Animation",
-        "Kids", "Entertainment", "Documentary", "General", "Series", "Comedy"
+        "News",
+        "Sports",
+        "Movies",
+        "Music",
+        "Animation",
+        "Kids",
+        "Entertainment",
+        "Documentary",
+        "General",
+        "Series",
+        "Comedy",
     ],
     "exclude_categories": ["XXX"],
-
     # Content & anti-trash filters
     "content_filters": {
         "enable_antitrash": True,
         "antitrash_keywords": [
-            "shop", "магазин", "ювелир", "телемагазин", "commercial", "infomercial",
-            "casino", "казино", "лотерея", "религия", "church", "test card"
+            "shop",
+            "магазин",
+            "ювелир",
+            "телемагазин",
+            "commercial",
+            "infomercial",
+            "casino",
+            "казино",
+            "лотерея",
+            "религия",
+            "church",
+            "test card",
         ],
         "blacklist_keywords": [],
         "whitelist_keywords": [],
-        "custom_regex": ""
+        "custom_regex": "",
     },
-
+    # Curated 4K list inclusion
+    "include_curated_4k": True,
     # Limits per language
-    "max_channels_per_language": {
-        "eng": 200,
-        "rus": 150
-    },
-
+    "max_channels_per_language": {"eng": 200, "rus": 150},
     # Stream checker
     "check_streams": True,
     "stream_check_timeout_seconds": 4.0,
     "max_concurrent_checks": 40,
     "max_concurrent_per_host": 6,
-
     # Output & Gist sync
     "github_token": "",  # prefer the GITHUB_TOKEN env var
     "gist_id": "",
-    "output_file": "playlist.m3u"
+    "output_file": "playlist.m3u",
 }
 
 PRESETS = {
     "balanced": {
         "description": "Balanced: all main categories (news, movies, sports, kids, docs)",
-        "categories": ["News", "Sports", "Movies", "Music", "Animation", "Kids", "Entertainment",
-                       "Documentary", "General", "Series", "Comedy"],
-        "min_resolution": "all"
+        "categories": [
+            "News",
+            "Sports",
+            "Movies",
+            "Music",
+            "Animation",
+            "Kids",
+            "Entertainment",
+            "Documentary",
+            "General",
+            "Series",
+            "Comedy",
+        ],
+        "min_resolution": "all",
+        "include_curated_4k": True,
     },
     "cinema": {
         "description": "Cinema: movies and series only, 720p and up",
         "categories": ["Movies", "Series"],
-        "min_resolution": "720p"
+        "min_resolution": "720p",
+        "include_curated_4k": True,
     },
     "sports": {
         "description": "Sports: sports channels, 720p and up",
         "categories": ["Sports"],
-        "min_resolution": "720p"
+        "min_resolution": "720p",
+        "include_curated_4k": True,
     },
     "kids": {
         "description": "Kids: cartoons, animation, kids shows",
         "categories": ["Animation", "Kids"],
-        "min_resolution": "all"
+        "min_resolution": "all",
+        "include_curated_4k": False,
     },
     "news": {
         "description": "News: news channels only",
         "categories": ["News"],
-        "min_resolution": "all"
-    }
+        "min_resolution": "all",
+        "include_curated_4k": False,
+    },
 }
 
 CATEGORY_MAP_RU = {
@@ -123,7 +154,7 @@ CATEGORY_MAP_RU = {
     "comedy": "[RU] Юмор",
     "education": "[RU] Образование",
     "culture": "[RU] Культура",
-    "classic": "[RU] Классика"
+    "classic": "[RU] Классика",
 }
 
 CATEGORY_MAP_UA = {
@@ -137,7 +168,7 @@ CATEGORY_MAP_UA = {
     "entertainment": "[UA] Розважальні",
     "documentary": "[UA] Пізнавальні",
     "series": "[UA] Серіали",
-    "comedy": "[UA] Гумор"
+    "comedy": "[UA] Гумор",
 }
 
 UHD_4K_CHANNELS = [
@@ -149,7 +180,7 @@ UHD_4K_CHANNELS = [
         "lang": "uhd",
         "tvg_logo": "https://i.imgur.com/xT0gWnL.png",
         "tvg_id": "LoveNature.ca@4K",
-        "detected_height": 2160
+        "detected_height": 2160,
     },
     {
         "name": "Eurosport 4K (2160p)",
@@ -159,7 +190,7 @@ UHD_4K_CHANNELS = [
         "lang": "uhd",
         "tvg_logo": "https://i.imgur.com/u3l9s1x.png",
         "tvg_id": "Eurosport4K.fr@4K",
-        "detected_height": 2160
+        "detected_height": 2160,
     },
     {
         "name": "Bloomberg TV+ 4K (2160p)",
@@ -169,7 +200,7 @@ UHD_4K_CHANNELS = [
         "lang": "uhd",
         "tvg_logo": "https://i.imgur.com/k9vjUeE.png",
         "tvg_id": "BloombergTVPlus.us@4K",
-        "detected_height": 2160
+        "detected_height": 2160,
     },
     {
         "name": "Ocean Vibes 4K (2160p)",
@@ -179,7 +210,7 @@ UHD_4K_CHANNELS = [
         "lang": "uhd",
         "tvg_logo": "https://i.imgur.com/gK9qC5D.png",
         "tvg_id": "OceanVibes.us@4K",
-        "detected_height": 2160
+        "detected_height": 2160,
     },
     {
         "name": "Fireplace Vibes 4K (2160p)",
@@ -189,7 +220,7 @@ UHD_4K_CHANNELS = [
         "lang": "uhd",
         "tvg_logo": "https://i.imgur.com/gK9qC5D.png",
         "tvg_id": "FireplaceVibes.us@4K",
-        "detected_height": 2160
+        "detected_height": 2160,
     },
     {
         "name": "NASA TV UHD",
@@ -199,7 +230,7 @@ UHD_4K_CHANNELS = [
         "lang": "uhd",
         "tvg_logo": "https://upload.wikimedia.org/wikipedia/commons/e/e5/NASA_logo.svg",
         "tvg_id": "NASATVUHD.us@UHD",
-        "detected_height": 2160
+        "detected_height": 2160,
     },
     {
         "name": "4K Travel TV",
@@ -209,9 +240,10 @@ UHD_4K_CHANNELS = [
         "lang": "uhd",
         "tvg_logo": "https://i.imgur.com/J3tG9t9.png",
         "tvg_id": "4KTravelTV.us@4K",
-        "detected_height": 2160
-    }
+        "detected_height": 2160,
+    },
 ]
+
 
 def load_config() -> dict:
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -229,6 +261,7 @@ def load_config() -> dict:
             print(f"[!] Failed to read {CONFIG_FILE}: {e}. Falling back to defaults.")
     return cfg
 
+
 def save_gist_id(gist_id: str):
     """Persist only the new gist_id, without dumping CLI overrides or the token into config.json."""
     try:
@@ -242,34 +275,48 @@ def save_gist_id(gist_id: str):
     except Exception as e:
         print(f"[!] Failed to save {CONFIG_FILE}: {e}")
 
+
 def get_channel_quality_score(ch: dict[str, Any]) -> int:
     """
     Returns numerical height: 2160, 1080, 720, 576, 480, etc.
     Prioritizes real HLS detected height from stream manifest,
-    falls back to string parsing tags.
+    falls back to string parsing tags with word boundary matching.
+    Excludes tvg_logo, logo URLs, and URL query tokens from keywords.
     """
     detected_h = ch.get("detected_height", 0)
     if detected_h > 0:
         return detected_h
 
-    name = ch.get("name", "").lower()
-    url = ch.get("url", "").lower()
-    meta = f"{name} {url} {ch.get('tvg_id', '')} {ch.get('extinf', '')}".lower()
+    name = ch.get("name", "")
+    url = ch.get("url", "")
+    # Exclude URL query parameters and fragments; replace underscores with spaces for word boundaries
+    url_path = url.split("?", 1)[0].split("#", 1)[0].replace("_", " ")
 
-    if any(x in meta for x in ["4k", "2160p", "uhd"]):
+    tvg_id = ch.get("tvg_id", "")
+    raw_group = ch.get("raw_group", "")
+
+    # Strip tvg-logo attribute completely from extinf to prevent logo URLs or image hashes from polluting score
+    extinf = ch.get("extinf", "")
+    extinf_clean = re.sub(r'tvg-logo=(?:"[^"]*"|\'[^\']*\'|\S+)', "", extinf, flags=re.IGNORECASE) if extinf else ""
+
+    meta = f"{name} {url_path} {tvg_id} {raw_group} {extinf_clean}"
+
+    if RE_QUALITY_4K.search(meta):
         return 2160
-    if any(x in meta for x in ["1080p", "fhd"]):
+    if RE_QUALITY_1080.search(meta):
         return 1080
-    if any(x in meta for x in ["720p", "hd"]):
+    if RE_QUALITY_720.search(meta):
         return 720
-    if "576p" in meta:
+    if RE_QUALITY_576.search(meta):
         return 576
-    if any(x in meta for x in ["480p", "sd"]):
+    if RE_QUALITY_480.search(meta):
         return 480
     return 540
 
+
 def is_high_def(ch: dict[str, Any]) -> bool:
     return get_channel_quality_score(ch) >= 720
+
 
 def format_group(ch: dict[str, Any]) -> str:
     if ch.get("lang") == "uhd":
@@ -301,12 +348,50 @@ def format_group(ch: dict[str, Any]) -> str:
 
     return f"[{lang.upper()}] {raw_group.title()}"
 
+
 def normalize_channel_name(name: str) -> str:
     n = name
-    n = re.sub(r'\b(FHD|HD|SD|4K|UHD|2K|HEVC|H\.265)\b', '', n, flags=re.IGNORECASE)
-    n = re.sub(r'[\(\[\{]\s*(\d{3,4}p|4k|not 24/7|geo-blocked|[A-Z]{2})\s*[\)\]\}]', '', n, flags=re.IGNORECASE)
-    n = re.sub(r'\s+', ' ', n).strip()
+    n = re.sub(r"\b(FHD|HD|SD|4K|UHD|2K|HEVC|H\.265)\b", "", n, flags=re.IGNORECASE)
+    n = re.sub(
+        r"[\(\[\{]\s*(\d{3,4}p|4k|not 24/7|geo-blocked|[A-Z]{2})\s*[\)\]\}]",
+        "",
+        n,
+        flags=re.IGNORECASE,
+    )
+    n = re.sub(r"\s+", " ", n).strip()
     return n.lower()
+
+
+@functools.lru_cache(maxsize=512)
+def _compile_keyword_pattern(kw: str) -> re.Pattern:
+    clean = kw.strip()
+    leading = r"\b" if re.match(r"^\w", clean) else ""
+    trailing = r"\b" if re.search(r"\w$", clean) else ""
+    return re.compile(rf"{leading}{re.escape(clean)}{trailing}", re.IGNORECASE)
+
+
+def matches_keyword(kw: str, text: str) -> bool:
+    clean = kw.strip()
+    if not clean:
+        return False
+    return bool(_compile_keyword_pattern(clean).search(text))
+
+
+def compile_custom_regex(pattern: str) -> re.Pattern | None:
+    """
+    Compiles custom regex pattern.
+    Emits an explicit warning and returns None on re.error.
+    """
+    clean = pattern.strip()
+    if not clean:
+        return None
+    try:
+        return re.compile(clean, re.IGNORECASE)
+    except re.error as e:
+        warnings.warn(f"Invalid custom_regex pattern '{clean}': {e}", UserWarning, stacklevel=2)
+        print(f"[!] Warning: Invalid custom_regex pattern '{clean}': {e}", file=sys.stderr)
+        return None
+
 
 def passes_content_filters(ch: dict[str, Any], filters: dict[str, Any]) -> tuple[bool, str]:
     """
@@ -320,12 +405,12 @@ def passes_content_filters(ch: dict[str, Any], filters: dict[str, Any]) -> tuple
     # 1. Anti-trash filter
     if filters.get("enable_antitrash", True):
         for kw in filters.get("antitrash_keywords", []):
-            if kw.lower() in text:
+            if matches_keyword(kw, text):
                 return False, f"Anti-trash keyword match: '{kw}'"
 
     # 2. Blacklist filter
     for kw in filters.get("blacklist_keywords", []):
-        if kw.lower() in text:
+        if matches_keyword(kw, text):
             return False, f"Blacklist match: '{kw}'"
 
     # 3. Whitelist filter (if defined)
@@ -336,13 +421,43 @@ def passes_content_filters(ch: dict[str, Any], filters: dict[str, Any]) -> tuple
     # 4. Custom regex
     pattern = filters.get("custom_regex", "").strip()
     if pattern:
-        try:
-            if not re.search(pattern, text, re.IGNORECASE):
-                return False, f"Regex mismatch: {pattern}"
-        except re.error:
-            pass
+        compiled = filters.get("_compiled_regex")
+        if compiled is None or getattr(compiled, "pattern", None) != pattern:
+            compiled_res = compile_custom_regex(pattern)
+            compiled = compiled_res if compiled_res is not None else _INVALID_REGEX
+            filters["_compiled_regex"] = compiled
+
+        if compiled is not _INVALID_REGEX and compiled is not None and not compiled.search(text):
+            return False, f"Regex mismatch: {pattern}"
 
     return True, "OK"
+
+
+def parse_extinf_line(extinf_line: str) -> tuple[str, str]:
+    """
+    Splits an #EXTINF line into (attributes_part, channel_name).
+    Correctly handles commas inside quoted attributes and channel names containing commas.
+    """
+    quote_char = None
+    comma_idx = -1
+    for idx, char in enumerate(extinf_line):
+        if quote_char is None and char in ('"', "'"):
+            quote_char = char
+        elif quote_char is not None and char == quote_char and (idx == 0 or extinf_line[idx - 1] != "\\"):
+            quote_char = None
+        elif char == "," and quote_char is None:
+            comma_idx = idx
+            break
+
+    if comma_idx != -1:
+        attrs_part = extinf_line[:comma_idx]
+        name = extinf_line[comma_idx + 1 :].strip()
+    else:
+        attrs_part = extinf_line
+        name = ""
+
+    return attrs_part, name or "Unknown Channel"
+
 
 def parse_m3u(content: str, lang: str = "eng") -> list[dict[str, Any]]:
     channels = []
@@ -366,23 +481,22 @@ def parse_m3u(content: str, lang: str = "eng") -> list[dict[str, Any]]:
             if current_extinf:
                 url = stripped
 
-                group_match = re.search(r'group-title="([^"]+)"', current_extinf, re.IGNORECASE)
+                attrs_part, name = parse_extinf_line(current_extinf)
+
+                group_match = re.search(r'group-title="([^"]+)"', attrs_part, re.IGNORECASE)
                 raw_group = group_match.group(1).strip() if group_match else "General"
 
-                name_match = re.search(r',([^,]+)$', current_extinf)
-                name = name_match.group(1).strip() if name_match else "Unknown Channel"
-
-                tvg_id_match = re.search(r'tvg-id="([^"]+)"', current_extinf, re.IGNORECASE)
+                tvg_id_match = re.search(r'tvg-id="([^"]+)"', attrs_part, re.IGNORECASE)
                 tvg_id = tvg_id_match.group(1).strip() if tvg_id_match else ""
 
-                tvg_logo_match = re.search(r'tvg-logo="([^"]+)"', current_extinf, re.IGNORECASE)
+                tvg_logo_match = re.search(r'tvg-logo="([^"]+)"', attrs_part, re.IGNORECASE)
                 tvg_logo = tvg_logo_match.group(1).strip() if tvg_logo_match else ""
 
                 headers = {}
-                ua_match = re.search(r'http-user-agent="([^"]+)"', current_extinf, re.IGNORECASE)
+                ua_match = re.search(r'http-user-agent="([^"]+)"', attrs_part, re.IGNORECASE)
                 if ua_match:
                     headers["User-Agent"] = ua_match.group(1).strip()
-                ref_match = re.search(r'http-referrer="([^"]+)"', current_extinf, re.IGNORECASE)
+                ref_match = re.search(r'http-referrer="([^"]+)"', attrs_part, re.IGNORECASE)
                 if ref_match:
                     headers["Referer"] = ref_match.group(1).strip()
 
@@ -403,7 +517,7 @@ def parse_m3u(content: str, lang: str = "eng") -> list[dict[str, Any]]:
                     "extra_lines": current_extra_lines,
                     "headers": headers,
                     "detected_height": 0,
-                    "bandwidth": 0
+                    "bandwidth": 0,
                 }
                 ch_obj["group"] = format_group(ch_obj)
                 channels.append(ch_obj)
@@ -412,6 +526,7 @@ def parse_m3u(content: str, lang: str = "eng") -> list[dict[str, Any]]:
                 current_extra_lines = []
 
     return channels
+
 
 async def fetch_playlist(session: aiohttp.ClientSession, url: str, lang: str = "eng") -> list[dict[str, Any]]:
     try:
@@ -424,6 +539,7 @@ async def fetch_playlist(session: aiohttp.ClientSession, url: str, lang: str = "
     except Exception as e:
         print(f"[!] Error fetching {url}: {e}")
     return []
+
 
 async def check_all_streams(
     channels: list[dict[str, Any]],
@@ -469,6 +585,7 @@ async def check_all_streams(
     lock = asyncio.Lock()
 
     async with aiohttp.ClientSession(connector=connector) as session:
+
         async def worker():
             nonlocal tested
             while True:
@@ -492,8 +609,11 @@ async def check_all_streams(
 
                         if tested % 25 == 0 or tested == total:
                             percent = (tested / total) * 100
-                            print(f"\r  -> Checked: {tested}/{total} ({percent:.1f}%) | alive: {len(alive_channels)}",
-                                  end="", flush=True)
+                            print(
+                                f"\r  -> Checked: {tested}/{total} ({percent:.1f}%) | alive: {len(alive_channels)}",
+                                end="",
+                                flush=True,
+                            )
                 except Exception:
                     async with lock:
                         tested += 1
@@ -521,6 +641,7 @@ async def check_all_streams(
         summary_out["drop_reasons"] = dict(drop_reasons)
 
     return alive_channels
+
 
 def deduplicate_channels(channels: list[dict[str, Any]]) -> list[dict[str, Any]]:
     best_channels = {}
@@ -550,11 +671,11 @@ def deduplicate_channels(channels: list[dict[str, Any]]) -> list[dict[str, Any]]
                         best_channels[key] = ch
     return list(best_channels.values())
 
+
 # Category ordering in playlist (UHD on top, then primary language, then the rest)
 CAT_ORDER = {
     # 4K Ultra HD
     "[UHD] 4K Channels": 1,
-
     # English (Primary)
     "[EN] News": 10,
     "[EN] Movies HD": 11,
@@ -566,7 +687,6 @@ CAT_ORDER = {
     "[EN] Entertainment": 17,
     "[EN] Music": 18,
     "[EN] General": 19,
-
     # Russian
     "[RU] Общие": 30,
     "[RU] Фильмы HD": 31,
@@ -579,7 +699,6 @@ CAT_ORDER = {
     "[RU] Детские": 38,
     "[RU] Музыка": 39,
     "[RU] Развлекательные": 40,
-
     # Ukrainian (if enabled)
     "[UA] Загальні": 50,
     "[UA] Кіно HD": 51,
@@ -588,8 +707,14 @@ CAT_ORDER = {
     "[UA] Спорт": 55,
 }
 
+
 def build_m3u(channels: list[dict[str, Any]], primary_lang: str = "eng") -> str:
-    epg_guides = "https://iptv-org.github.io/epg/guides/us.xml,https://iptv-org.github.io/epg/guides/uk.xml,https://iptv-org.github.io/epg/guides/ru.xml,https://iptv-org.github.io/epg/guides/ua.xml"
+    epg_guides = (
+        "https://iptv-org.github.io/epg/guides/us.xml,"
+        "https://iptv-org.github.io/epg/guides/uk.xml,"
+        "https://iptv-org.github.io/epg/guides/ru.xml,"
+        "https://iptv-org.github.io/epg/guides/ua.xml"
+    )
     lines = [f'#EXTM3U url-tvg="{epg_guides}"']
 
     # Languages ordering: UHD at top, then primary (ENG), then secondary (RUS), then others
@@ -598,26 +723,24 @@ def build_m3u(channels: list[dict[str, Any]], primary_lang: str = "eng") -> str:
         primary_lang: 0,
         "eng": 1 if primary_lang != "eng" else 0,
         "rus": 2 if primary_lang != "rus" else 0,
-        "ukr": 3
+        "ukr": 3 if primary_lang != "ukr" else 0,
     }
-
-    for ch in channels:
-        ch["group"] = format_group(ch)
 
     sorted_channels = sorted(
         channels,
         key=lambda x: (
             lang_priority.get(x.get("lang", ""), 99),
-            CAT_ORDER.get(x.get("group", ""), 99),
-            x.get("group", "").lower(),
-            x.get("name", "").lower()
-        )
+            CAT_ORDER.get(x.get("group") or format_group(x), 99),
+            (x.get("group") or format_group(x)).lower(),
+            x.get("name", "").lower(),
+        ),
     )
 
     for ch in sorted_channels:
+        group_val = ch.get("group") or format_group(ch)
         tvg_id_part = f' tvg-id="{ch["tvg_id"]}"' if ch.get("tvg_id") else ""
         tvg_logo_part = f' tvg-logo="{ch["tvg_logo"]}"' if ch.get("tvg_logo") else ""
-        group_part = f' group-title="{ch["group"]}"' if ch.get("group") else ""
+        group_part = f' group-title="{group_val}"' if group_val else ""
 
         headers_part = ""
         if "User-Agent" in ch.get("headers", {}):
@@ -625,20 +748,39 @@ def build_m3u(channels: list[dict[str, Any]], primary_lang: str = "eng") -> str:
         if "Referer" in ch.get("headers", {}):
             headers_part += f' http-referrer="{ch["headers"]["Referer"]}"'
 
-        extinf_line = f'#EXTINF:-1{tvg_id_part}{tvg_logo_part}{group_part}{headers_part},{ch["name"]}'
+        extinf_line = f"#EXTINF:-1{tvg_id_part}{tvg_logo_part}{group_part}{headers_part},{ch['name']}"
         lines.append(extinf_line)
 
+        seen_extras = set()
         for extra in ch.get("extra_lines", []):
-            lines.append(extra)
+            stripped_extra = extra.strip()
+            if not stripped_extra:
+                continue
+            extra_lower = stripped_extra.lower()
+            if extra_lower.startswith("#extvlcopt:http-user-agent=") and "http-user-agent=" in headers_part:
+                continue
+            if (
+                extra_lower.startswith("#extvlcopt:http-referrer=")
+                or extra_lower.startswith("#extvlcopt:http-referer=")
+            ) and "http-referrer=" in headers_part:
+                continue
+            if extra_lower in seen_extras:
+                continue
+            seen_extras.add(extra_lower)
+            lines.append(stripped_extra)
 
         lines.append(ch["url"])
 
     return "\n".join(lines) + "\n"
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Smart IPTV Stream Curator & Parser")
-    parser.add_argument("--profile", choices=list(PRESETS.keys()) + ["custom"],
-                        help="Select profile preset (balanced, cinema, sports, kids, news, custom)")
+    parser.add_argument(
+        "--profile",
+        choices=list(PRESETS.keys()) + ["custom"],
+        help="Select profile preset (balanced, cinema, sports, kids, news, custom)",
+    )
     parser.add_argument("--lang", help="Comma-separated languages (e.g. 'eng,rus' or 'eng')")
     parser.add_argument("--min-res", choices=["all", "720p", "1080p", "4k"], help="Minimum resolution filter")
     parser.add_argument("--no-check", action="store_true", help="Skip online stream checks (faster)")
@@ -646,23 +788,55 @@ def parse_args():
     parser.add_argument("--summary-json", help="Path to write run summary/diagnostics JSON file")
     return parser.parse_args()
 
+
+def resolve_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """
+    Applies profile presets and explicit CLI argument overrides to cfg.
+    Explicit CLI flags take precedence over profile presets.
+    """
+    cfg = copy.deepcopy(cfg)
+
+    # 1. Profile selection
+    if getattr(args, "profile", None):
+        cfg["profile"] = args.profile
+
+    profile_name = cfg.get("profile", "balanced")
+    if profile_name in PRESETS:
+        preset = PRESETS[profile_name]
+        if profile_name != "custom":
+            cfg["categories"] = list(preset.get("categories", cfg.get("categories", [])))
+            cfg["min_resolution"] = preset.get("min_resolution", cfg.get("min_resolution", "all"))
+            if "include_curated_4k" in preset:
+                cfg["include_curated_4k"] = preset["include_curated_4k"]
+
+    # 2. Explicit CLI Overrides take precedence over profile presets
+    if getattr(args, "min_res", None):
+        cfg["min_resolution"] = args.min_res
+    if getattr(args, "lang", None):
+        raw_langs = [code.strip().lower() for code in args.lang.split(",") if code.strip()]
+        dedup_langs = list(dict.fromkeys(raw_langs))
+        if dedup_langs:
+            cfg["languages"] = dedup_langs
+            cfg["primary_language"] = dedup_langs[0]
+    if getattr(args, "no_check", False):
+        cfg["check_streams"] = False
+    if getattr(args, "no_antitrash", False):
+        cfg.setdefault("content_filters", {})["enable_antitrash"] = False
+    if getattr(args, "summary_json", None):
+        cfg["summary_json"] = args.summary_json
+
+    # Deduplicate languages and ensure consistent primary_language
+    cfg["languages"] = list(dict.fromkeys(cfg.get("languages", ["eng", "rus"])))
+    if "primary_language" not in cfg or cfg["primary_language"] not in cfg["languages"]:
+        cfg["primary_language"] = cfg["languages"][0] if cfg["languages"] else "eng"
+
+    return cfg
+
+
 async def main():
     args = parse_args()
-    cfg = load_config()
-
-    # CLI Overrides
-    if args.profile:
-        cfg["profile"] = args.profile
-    if args.lang:
-        cfg["languages"] = [code.strip().lower() for code in args.lang.split(",")]
-    if args.min_res:
-        cfg["min_resolution"] = args.min_res
-    if args.no_check:
-        cfg["check_streams"] = False
-    if args.no_antitrash:
-        cfg["content_filters"]["enable_antitrash"] = False
-    if args.summary_json:
-        cfg["summary_json"] = args.summary_json
+    base_cfg = load_config()
+    cfg = resolve_config(base_cfg, args)
 
     profile_name = cfg.get("profile", "balanced")
     if profile_name in PRESETS:
@@ -671,10 +845,6 @@ async def main():
         print(f"  Smart IPTV Stream Curator - profile: [{profile_name.upper()}]")
         print(f"  {preset['description']}")
         print("=" * 65)
-        if profile_name != "custom":
-            cfg["categories"] = preset.get("categories", cfg["categories"])
-            if cfg["min_resolution"] == "all" and preset.get("min_resolution") != "all":
-                cfg["min_resolution"] = preset["min_resolution"]
     else:
         print("=" * 65)
         print("  Smart IPTV Stream Curator - custom profile")
@@ -693,32 +863,57 @@ async def main():
     min_res = cfg.get("min_resolution", "all").lower()
     max_per_lang = cfg.get("max_channels_per_language", {"eng": 200, "rus": 150})
 
+    # Precompile custom_regex once at startup
+    if "custom_regex" in content_filters and content_filters["custom_regex"].strip():
+        pat = content_filters["custom_regex"].strip()
+        compiled = compile_custom_regex(pat)
+        content_filters["_compiled_regex"] = compiled if compiled is not None else _INVALID_REGEX
+
     print(f"[*] Primary language: [{primary_lang.upper()}], languages: {', '.join(languages)}")
     print(f"[*] Min resolution: [{min_res.upper()}]")
     print(f"[*] Categories: {', '.join(cfg.get('categories', [])) if allowed_categories else 'all'}")
     print(f"[*] Anti-trash filter: {'on' if content_filters.get('enable_antitrash', True) else 'off'}")
 
-    # 1. Fetch playlists from sources
+    # 1. Fetch playlists from sources (parallel via asyncio.gather with TLS enabled)
     all_channels = []
     seen_urls = set()
     trash_count = 0
 
     resolver = aiohttp.ThreadedResolver()
-    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False)  # see note in check_all_streams
+    connector = aiohttp.TCPConnector(resolver=resolver)  # TLS enabled for trusted playlist downloads
     async with aiohttp.ClientSession(connector=connector) as session:
+        fetch_tasks = []
+        task_meta = []
+
         # A. Official iptv-org sources
         if sources_cfg.get("iptv_org", True):
             for lang in languages:
                 url = f"https://iptv-org.github.io/iptv/languages/{lang}.m3u"
-                print(f"[*] Fetching [{lang.upper()}] from iptv-org...")
-                chans = await fetch_playlist(session, url, lang=lang)
-                print(f"    -> {len(chans)} channels.")
+                fetch_tasks.append(fetch_playlist(session, url, lang=lang))
+                task_meta.append(("iptv_org", lang, url))
+
+        # B. Custom M3U URLs (Multi-source)
+        for custom_url in sources_cfg.get("custom_m3u_urls", []):
+            url = custom_url.strip()
+            if url:
+                fetch_tasks.append(fetch_playlist(session, url, lang="custom"))
+                task_meta.append(("custom", "custom", url))
+
+        if fetch_tasks:
+            results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+            for (source_type, lang, url), res in zip(task_meta, results, strict=True):
+                if isinstance(res, Exception):
+                    print(f"[!] Error fetching {url}: {res}")
+                    continue
+                chans = res
+                label = lang.upper() if source_type == "iptv_org" else "CUSTOM"
+                print(f"[*] Fetched {len(chans)} channels from {url} [{label}].")
 
                 for ch in chans:
-                    url = ch["url"]
-                    if url in seen_urls:
+                    url_val = ch["url"]
+                    if url_val in seen_urls:
                         continue
-                    seen_urls.add(url)
+                    seen_urls.add(url_val)
 
                     raw_grp = ch.get("raw_group", "").lower()
                     if any(ex in raw_grp for ex in exclude_categories):
@@ -726,26 +921,12 @@ async def main():
                     if allowed_categories and not any(allowed in raw_grp for allowed in allowed_categories):
                         continue
 
-                    # Content & anti-trash filter
-                    passed, reason = passes_content_filters(ch, content_filters)
+                    passed, _ = passes_content_filters(ch, content_filters)
                     if not passed:
                         trash_count += 1
                         continue
 
                     all_channels.append(ch)
-
-        # B. Custom M3U URLs (Multi-source)
-        for custom_url in sources_cfg.get("custom_m3u_urls", []):
-            if custom_url.strip():
-                print(f"[*] Fetching custom playlist: {custom_url}...")
-                custom_chans = await fetch_playlist(session, custom_url.strip(), lang="custom")
-                print(f"    -> {len(custom_chans)} channels.")
-                for ch in custom_chans:
-                    if ch["url"] not in seen_urls:
-                        seen_urls.add(ch["url"])
-                        passed, reason = passes_content_filters(ch, content_filters)
-                        if passed:
-                            all_channels.append(ch)
 
     # C. Local M3U Files
     for local_file in sources_cfg.get("local_m3u_files", []):
@@ -760,13 +941,15 @@ async def main():
                         if passed:
                             all_channels.append(ch)
 
-    # D. Built-in free 4K channels (unless filtered out)
-    for ch4k in UHD_4K_CHANNELS:
-        if ch4k["url"] not in seen_urls:
-            seen_urls.add(ch4k["url"])
-            passed, _ = passes_content_filters(ch4k, content_filters)
-            if passed:
-                all_channels.append(ch4k)
+    # D. Built-in free 4K channels (unless filtered out by profile)
+    if cfg.get("include_curated_4k", True):
+        for ch4k in UHD_4K_CHANNELS:
+            ch_copy = copy.deepcopy(ch4k)
+            if ch_copy["url"] not in seen_urls:
+                seen_urls.add(ch_copy["url"])
+                passed, _ = passes_content_filters(ch_copy, content_filters)
+                if passed:
+                    all_channels.append(ch_copy)
 
     print(f"\n[+] Candidates: {len(all_channels)} (dropped by anti-trash/blacklist: {trash_count})")
     summary_path = (cfg.get("summary_json") or getattr(args, "summary_json", None) or "").strip()
@@ -824,7 +1007,11 @@ async def main():
 
     # 5. Apply per-language quotas
     final_channels = []
-    lang_order = ["uhd", primary_lang] + [code for code in languages if code != primary_lang] + ["custom", "local"]
+    lang_order = list(
+        dict.fromkeys(
+            ["uhd", primary_lang] + [code for code in languages if code != primary_lang] + ["custom", "local"]
+        )
+    )
     for lang in lang_order:
         lang_chans = [c for c in working_channels if c.get("lang") == lang]
         limit = max_per_lang.get(lang)
@@ -874,6 +1061,7 @@ async def main():
         print("\n[*] Gist sync not configured, playlist is local only.")
 
     write_summary_json(len(final_channels), len(working_channels))
+
 
 if __name__ == "__main__":
     asyncio.run(main())

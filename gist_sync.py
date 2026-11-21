@@ -23,37 +23,24 @@ class GistSync:
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "IPTV-Updater-Script"
+            "User-Agent": "IPTV-Updater-Script",
         }
 
-        payload = {
-            "description": "Custom IPTV Playlist (Auto-updated)",
-            "files": {
-                filename: {
-                    "content": m3u_content
-                }
-            }
-        }
+        payload = {"description": "Custom IPTV Playlist (Auto-updated)", "files": {filename: {"content": m3u_content}}}
 
         try:
             if self.gist_id:
                 # Update existing Gist
                 url = f"https://api.github.com/gists/{self.gist_id}"
                 req = urllib.request.Request(
-                    url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers=headers,
-                    method="PATCH"
+                    url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PATCH"
                 )
             else:
                 # Create a secret (unlisted) Gist
                 payload["public"] = False
                 url = "https://api.github.com/gists"
                 req = urllib.request.Request(
-                    url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers=headers,
-                    method="POST"
+                    url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
                 )
 
             with urllib.request.urlopen(req, timeout=15) as resp:
