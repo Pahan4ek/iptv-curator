@@ -1,7 +1,7 @@
 name: update playlist
 
 # Weekly rebuild + push to your gist. Needs two repo secrets:
-#   GIST_TOKEN - classic PAT with the `gist` scope
+#   GIST_TOKEN - classic PAT with the `gist` scope (or GITHUB_TOKEN)
 #   GIST_ID    - id of an existing gist (run the script locally once to create it)
 on:
   schedule:
@@ -19,6 +19,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Build and sync playlist
         env:
-          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: python iptv_updater.py
