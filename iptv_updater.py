@@ -90,9 +90,10 @@ DEFAULT_CONFIG = {
     "max_concurrent_checks": 40,
     "max_concurrent_per_host": 6,
     # Output & Gist sync
-    "github_token": "",  # prefer the GITHUB_TOKEN env var
+    "github_token": "",  # prefer GIST_TOKEN or GITHUB_TOKEN env var
     "gist_id": "",
     "output_file": "playlist.m3u",
+    "min_channels_to_sync": 10,
 }
 
 PRESETS = {
@@ -774,6 +775,67 @@ def build_m3u(channels: list[dict[str, Any]], primary_lang: str = "eng") -> str:
     return "\n".join(lines) + "\n"
 
 
+def get_github_token(cfg: dict[str, Any]) -> str:
+    """
+    Retrieves GitHub token in priority order:
+    1. GIST_TOKEN env var
+    2. GITHUB_TOKEN env var
+    3. config.json 'github_token'
+    """
+    env_gist = os.environ.get("GIST_TOKEN", "").strip()
+    if env_gist:
+        return env_gist
+    env_gh = os.environ.get("GITHUB_TOKEN", "").strip()
+    if env_gh:
+        return env_gh
+    return str(cfg.get("github_token", "")).strip()
+
+
+def get_gist_id(cfg: dict[str, Any]) -> str:
+    """
+    Retrieves Gist ID in priority order:
+    1. GIST_ID env var
+    2. config.json 'gist_id'
+    """
+    env_id = os.environ.get("GIST_ID", "").strip()
+    if env_id:
+        return env_id
+    return str(cfg.get("gist_id", "")).strip()
+
+
+def sync_to_gist(
+    m3u_text: str,
+    channel_count: int,
+    cfg: dict[str, Any],
+    sync: GistSync | None = None,
+    output_filename: str = "playlist.m3u",
+) -> tuple[bool, str, str | None]:
+    """
+    Validates safety threshold and uploads/updates playlist on GitHub Gist.
+    Returns (success: bool, url_or_error: str, new_gist_id: str | None).
+    """
+    min_channels = max(0, int(cfg.get("min_channels_to_sync", 10)))
+    force_sync = bool(cfg.get("force_sync", False))
+
+    if channel_count < min_channels and not force_sync:
+        msg = (
+            f"Safety check failed: live channels ({channel_count}) below threshold "
+            f"min_channels_to_sync={min_channels}. Aborting Gist sync to protect remote playlist. "
+            "Use --force-sync to override."
+        )
+        return False, msg, None
+
+    if sync is None:
+        token = get_github_token(cfg)
+        gist_id = get_gist_id(cfg)
+        sync = GistSync(token=token, gist_id=gist_id)
+
+    if not sync.is_configured():
+        return False, "GitHub token is not configured.", None
+
+    return sync.sync_playlist(m3u_text, filename=output_filename)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Smart IPTV Stream Curator & Parser")
     parser.add_argument(
@@ -786,6 +848,16 @@ def parse_args():
     parser.add_argument("--no-check", action="store_true", help="Skip online stream checks (faster)")
     parser.add_argument("--no-antitrash", action="store_true", help="Disable anti-trash keyword filter")
     parser.add_argument("--summary-json", help="Path to write run summary/diagnostics JSON file")
+    parser.add_argument(
+        "--min-channels",
+        type=int,
+        help="Minimum number of live channels required to sync playlist to Gist (default: 10)",
+    )
+    parser.add_argument(
+        "--force-sync",
+        action="store_true",
+        help="Force Gist sync even if live channel count is below threshold",
+    )
     return parser.parse_args()
 
 
@@ -824,6 +896,10 @@ def resolve_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, A
         cfg.setdefault("content_filters", {})["enable_antitrash"] = False
     if getattr(args, "summary_json", None):
         cfg["summary_json"] = args.summary_json
+    if getattr(args, "min_channels", None) is not None:
+        cfg["min_channels_to_sync"] = max(0, args.min_channels)
+    if getattr(args, "force_sync", False):
+        cfg["force_sync"] = True
 
     # Deduplicate languages and ensure consistent primary_language
     cfg["languages"] = list(dict.fromkeys(cfg.get("languages", ["eng", "rus"])))
@@ -1038,13 +1114,20 @@ async def main():
 
     # 7. Gist Sync
     # Env vars win over config.json, so the token never has to live in a file
-    token = (os.environ.get("GITHUB_TOKEN") or cfg.get("github_token", "")).strip()
-    gist_id = (os.environ.get("GIST_ID") or cfg.get("gist_id", "")).strip()
+    token = get_github_token(cfg)
+    gist_id = get_gist_id(cfg)
     sync = GistSync(token=token, gist_id=gist_id)
 
     if sync.is_configured():
         print("\n[*] Syncing to GitHub Gist...")
-        success, url_or_err, new_id = sync.sync_playlist(m3u_text, filename="playlist.m3u")
+        output_filename = os.path.basename(output_file) or "playlist.m3u"
+        success, url_or_err, new_id = sync_to_gist(
+            m3u_text=m3u_text,
+            channel_count=len(final_channels),
+            cfg=cfg,
+            sync=sync,
+            output_filename=output_filename,
+        )
         if success:
             if new_id and new_id != gist_id:
                 save_gist_id(new_id)
@@ -1056,7 +1139,9 @@ async def main():
             print("#" * 65)
             print(" Add it to your player once, it will pick up new versions automatically.\n")
         else:
-            print(f"[!] Gist error: {url_or_err}")
+            print(f"[!] Gist sync failed: {url_or_err}")
+            write_summary_json(len(final_channels), len(working_channels))
+            sys.exit(1)
     else:
         print("\n[*] Gist sync not configured, playlist is local only.")
 

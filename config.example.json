@@ -58,5 +58,6 @@
   "max_concurrent_per_host": 6,
   "github_token": "",
   "gist_id": "",
-  "output_file": "playlist.m3u"
+  "output_file": "playlist.m3u",
+  "min_channels_to_sync": 10
 }
