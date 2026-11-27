@@ -8,6 +8,7 @@ from checker import (  # noqa: E402
     DEFAULT_USER_AGENT,
     CheckResult,
     check_single_stream,
+    extract_hls_variant_url,
     is_mpegts,
     is_valid_media_binary,
     parse_hls_stream_info,
@@ -23,9 +24,11 @@ class MockStreamResponse:
         status: int = 200,
         content_type: str = "video/mp2t",
         extra_headers: dict[str, str] | None = None,
+        url: str | None = None,
     ):
         self._chunks = list(chunks)
         self.status = status
+        self.url = url
         self.headers = {"Content-Type": content_type}
         if extra_headers:
             self.headers.update(extra_headers)
@@ -394,3 +397,158 @@ def test_check_stream_timeout_and_network_error():
     assert res.alive is False
     assert res.reason == "network_error"
     assert res.status_code is None
+
+
+class RoutingMockClientSession:
+    """Mock ClientSession returning queued/routed MockStreamResponse instances and recording calls."""
+
+    def __init__(self, responses: list[MockStreamResponse]):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    def get(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        if not self._responses:
+            raise AssertionError(f"Unexpected HTTP GET to {url}")
+        return self._responses.pop(0)
+
+
+def test_deep_check_master_playlist_variant_statuses():
+    master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n720p/index.m3u8\n"
+    channel = {"url": "https://tv.example/live/master.m3u8"}
+
+    # 1. Master 200 -> variant 403: deep_check=False returns True, deep_check=True returns False (hls_variant_403)
+    session_no_deep = RoutingMockClientSession(
+        [
+            MockStreamResponse([master], status=200, content_type="application/vnd.apple.mpegurl"),
+            MockStreamResponse([], status=403),
+        ]
+    )
+    res_shallow = asyncio.run(check_single_stream(session_no_deep, channel, deep_check=False))
+    assert res_shallow.alive is True
+    assert res_shallow.reason == "ok"
+    assert len(session_no_deep.calls) == 1
+
+    session_403 = RoutingMockClientSession(
+        [
+            MockStreamResponse([master], status=200, content_type="application/vnd.apple.mpegurl"),
+            MockStreamResponse([], status=403),
+        ]
+    )
+    res_deep_403 = asyncio.run(check_single_stream(session_403, channel, deep_check=True))
+    assert res_deep_403.alive is False
+    assert res_deep_403.reason == "hls_variant_403"
+    assert res_deep_403.status_code == 403
+    assert len(session_403.calls) == 2
+
+    # 2. Variant 404 -> hls_variant_404
+    session_404 = RoutingMockClientSession(
+        [
+            MockStreamResponse([master], status=200, content_type="application/vnd.apple.mpegurl"),
+            MockStreamResponse([], status=404),
+        ]
+    )
+    res_deep_404 = asyncio.run(check_single_stream(session_404, channel, deep_check=True))
+    assert res_deep_404.alive is False
+    assert res_deep_404.reason == "hls_variant_404"
+    assert res_deep_404.status_code == 404
+
+    # 3. Variant 200 OK with valid media playlist -> alive=True and keeps parsed stream_info
+    variant_media = b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg0.ts\n"
+    session_200 = RoutingMockClientSession(
+        [
+            MockStreamResponse([master], status=200, content_type="application/vnd.apple.mpegurl"),
+            MockStreamResponse([variant_media], status=200, content_type="application/vnd.apple.mpegurl"),
+        ]
+    )
+    res_deep_ok = asyncio.run(check_single_stream(session_200, channel, deep_check=True))
+    assert res_deep_ok.alive is True
+    assert res_deep_ok.reason == "ok"
+    assert res_deep_ok.stream_info["max_height"] == 720
+
+    # 4. Variant 200 OK returning HTML error page -> rejected
+    session_html = RoutingMockClientSession(
+        [
+            MockStreamResponse([master], status=200, content_type="application/vnd.apple.mpegurl"),
+            MockStreamResponse([b"<!DOCTYPE html><html>Geo-blocked</html>"], status=200, content_type="text/html"),
+        ]
+    )
+    res_deep_html = asyncio.run(check_single_stream(session_html, channel, deep_check=True))
+    assert res_deep_html.alive is False
+    assert res_deep_html.reason == "hls_variant_html"
+
+
+def test_deep_check_relative_urljoin_after_redirect():
+    master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720\nvariants/720p.m3u8\n"
+    variant_media = b"#EXTM3U\n#EXTINF:4.0,\nseg_001.ts\n"
+
+    session = RoutingMockClientSession(
+        [
+            MockStreamResponse(
+                [master],
+                status=200,
+                content_type="application/vnd.apple.mpegurl",
+                url="https://cdn.example/edge/ch42/master.m3u8?token=abc",
+            ),
+            MockStreamResponse([variant_media], status=200, content_type="application/vnd.apple.mpegurl"),
+        ]
+    )
+
+    res = asyncio.run(
+        check_single_stream(
+            session,
+            {"url": "http://balancer.example/start/stream.m3u8"},
+            deep_check=True,
+        )
+    )
+    assert res.alive is True
+    assert len(session.calls) == 2
+    assert session.calls[0]["url"] == "http://balancer.example/start/stream.m3u8"
+    assert session.calls[1]["url"] == "https://cdn.example/edge/ch42/variants/720p.m3u8"
+
+    # Unit checks for extract_hls_variant_url across relative, root-relative, and absolute paths
+    assert (
+        extract_hls_variant_url(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n../hd/chunklist.m3u8",
+            "https://cdn.example/live/sd/master.m3u8",
+        )
+        == "https://cdn.example/live/hd/chunklist.m3u8"
+    )
+    assert (
+        extract_hls_variant_url(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n/stream/1080p.m3u8",
+            "https://cdn.example/live/sd/master.m3u8",
+        )
+        == "https://cdn.example/stream/1080p.m3u8"
+    )
+    assert (
+        extract_hls_variant_url(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nhttps://other.cdn/720p.m3u8",
+            "https://cdn.example/live/sd/master.m3u8",
+        )
+        == "https://other.cdn/720p.m3u8"
+    )
+
+
+def test_check_stream_proxy_passed_to_requests():
+    master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n720p.m3u8\n"
+    variant_media = b"#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n"
+    session = RoutingMockClientSession(
+        [
+            MockStreamResponse([master], status=200, content_type="application/vnd.apple.mpegurl"),
+            MockStreamResponse([variant_media], status=200, content_type="application/vnd.apple.mpegurl"),
+        ]
+    )
+
+    res = asyncio.run(
+        check_single_stream(
+            session,
+            {"url": "https://tv.example/master.m3u8"},
+            deep_check=True,
+            proxy="http://127.0.0.1:8080",
+        )
+    )
+    assert res.alive is True
+    assert len(session.calls) == 2
+    assert session.calls[0]["proxy"] == "http://127.0.0.1:8080"
+    assert session.calls[1]["proxy"] == "http://127.0.0.1:8080"

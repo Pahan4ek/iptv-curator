@@ -9,10 +9,11 @@ import sys
 import time
 import warnings
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
-from checker import check_single_stream
+from checker import check_single_stream, is_socks_proxy
 from gist_sync import GistSync
 
 try:
@@ -86,6 +87,8 @@ DEFAULT_CONFIG = {
     "max_channels_per_language": {"eng": 200, "rus": 150},
     # Stream checker
     "check_streams": True,
+    "deep_check": False,
+    "proxy": "",
     "stream_check_timeout_seconds": 4.0,
     "max_concurrent_checks": 40,
     "max_concurrent_per_host": 6,
@@ -542,6 +545,34 @@ async def fetch_playlist(session: aiohttp.ClientSession, url: str, lang: str = "
     return []
 
 
+def mask_proxy_url(proxy: str) -> str:
+    """Redacts credentials from a proxy URL before logging."""
+    try:
+        parts = urlsplit(proxy)
+        if parts.password is not None or parts.username is not None:
+            host_port = parts.hostname or ""
+            if parts.port:
+                host_port = f"{host_port}:{parts.port}"
+            user = parts.username or ""
+            netloc = f"{user}:***@{host_port}" if user else f"***@{host_port}"
+            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        pass
+    return proxy
+
+
+def get_proxy_url(cfg: dict[str, Any]) -> str:
+    """
+    Retrieves stream checker proxy URL in priority order:
+    1. cfg['proxy'] (already populated from --proxy > IPTV_PROXY > config.json in resolve_config)
+    2. IPTV_PROXY env var (fallback when check_all_streams is called directly)
+    """
+    cfg_proxy = str(cfg.get("proxy", "") or "").strip()
+    if cfg_proxy:
+        return cfg_proxy
+    return os.environ.get("IPTV_PROXY", "").strip()
+
+
 async def check_all_streams(
     channels: list[dict[str, Any]],
     cfg: dict,
@@ -560,24 +591,52 @@ async def check_all_streams(
     limit_per_host = max(1, raw_limit_per_host)
 
     timeout = float(cfg.get("stream_check_timeout_seconds", 4.0))
+    deep_check = bool(cfg.get("deep_check", False))
+    proxy = get_proxy_url(cfg) or None
+
+    supported_schemes = ("http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://")
+    if proxy and not proxy.lower().startswith(supported_schemes):
+        raise ValueError(f"Unsupported proxy URL scheme: {mask_proxy_url(proxy)}")
 
     total = len(channels)
-    print(f"\n[*] Checking streams ({total} channels, concurrency {concurrency}, timeout {timeout}s)...")
+    extras = []
+    if deep_check:
+        extras.append("deep-check")
+    if proxy:
+        extras.append(f"proxy={mask_proxy_url(proxy)}")
+    extra_info = f", {', '.join(extras)}" if extras else ""
+    print(f"\n[*] Checking streams ({total} channels, concurrency {concurrency}, timeout {timeout}s{extra_info})...")
 
     queue = asyncio.Queue()
     for ch in channels:
         queue.put_nowait(ch)
 
-    resolver = aiohttp.ThreadedResolver()
-    # ssl=False on purpose: lots of free IPTV origins run expired/self-signed certs,
-    # and we only read the first 4 KB of a public stream here, nothing sensitive is sent.
-    connector = aiohttp.TCPConnector(
-        resolver=resolver,
-        ssl=False,
-        limit=concurrency,
-        limit_per_host=limit_per_host,
-        ttl_dns_cache=300,
-    )
+    use_socks = is_socks_proxy(proxy)
+    if use_socks:
+        try:
+            from aiohttp_socks import ProxyConnector
+        except ImportError as exc:
+            raise RuntimeError(
+                "SOCKS proxy support requires 'aiohttp-socks'. Install it with: pip install aiohttp-socks"
+            ) from exc
+        connector = ProxyConnector.from_url(
+            proxy,
+            ssl=False,
+            limit=concurrency,
+            limit_per_host=limit_per_host,
+            ttl_dns_cache=300,
+        )
+    else:
+        resolver = aiohttp.ThreadedResolver()
+        # ssl=False on purpose: lots of free IPTV origins run expired/self-signed certs,
+        # and we only read the first 4 KB of a public stream here, nothing sensitive is sent.
+        connector = aiohttp.TCPConnector(
+            resolver=resolver,
+            ssl=False,
+            limit=concurrency,
+            limit_per_host=limit_per_host,
+            ttl_dns_cache=300,
+        )
 
     tested = 0
     alive_channels = []
@@ -595,7 +654,12 @@ async def check_all_streams(
                 except asyncio.QueueEmpty:
                     break
                 try:
-                    res = await check_single_stream(session, ch, timeout_sec=timeout)
+                    check_kwargs: dict[str, Any] = {"timeout_sec": timeout}
+                    if deep_check:
+                        check_kwargs["deep_check"] = True
+                    if proxy and not use_socks:
+                        check_kwargs["proxy"] = proxy
+                    res = await check_single_stream(session, ch, **check_kwargs)
                     async with lock:
                         tested += 1
                         if res.alive:
@@ -846,6 +910,15 @@ def parse_args():
     parser.add_argument("--lang", help="Comma-separated languages (e.g. 'eng,rus' or 'eng')")
     parser.add_argument("--min-res", choices=["all", "720p", "1080p", "4k"], help="Minimum resolution filter")
     parser.add_argument("--no-check", action="store_true", help="Skip online stream checks (faster)")
+    parser.add_argument(
+        "--deep-check",
+        action="store_true",
+        help="Verify HLS variant playlists return 200 OK (catches geo-blocks/expired tokens; slower)",
+    )
+    parser.add_argument(
+        "--proxy",
+        help="HTTP/SOCKS proxy URL for stream checks (overrides IPTV_PROXY env var and config)",
+    )
     parser.add_argument("--no-antitrash", action="store_true", help="Disable anti-trash keyword filter")
     parser.add_argument("--summary-json", help="Path to write run summary/diagnostics JSON file")
     parser.add_argument(
@@ -892,6 +965,15 @@ def resolve_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, A
             cfg["primary_language"] = dedup_langs[0]
     if getattr(args, "no_check", False):
         cfg["check_streams"] = False
+    if getattr(args, "deep_check", False):
+        cfg["deep_check"] = True
+    cli_proxy = (getattr(args, "proxy", None) or "").strip()
+    if cli_proxy:
+        cfg["proxy"] = cli_proxy
+    else:
+        env_proxy = os.environ.get("IPTV_PROXY", "").strip()
+        if env_proxy:
+            cfg["proxy"] = env_proxy
     if getattr(args, "no_antitrash", False):
         cfg.setdefault("content_filters", {})["enable_antitrash"] = False
     if getattr(args, "summary_json", None):

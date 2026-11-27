@@ -1,8 +1,10 @@
 import asyncio
+import contextlib
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urljoin
 
 import aiohttp
 
@@ -70,6 +72,39 @@ def parse_hls_stream_info(manifest_text: str) -> dict[str, Any]:
     return info
 
 
+def extract_hls_variant_url(manifest_text: str, base_url: str) -> str | None:
+    """
+    Extracts the first variant playlist URL following an #EXT-X-STREAM-INF tag
+    and resolves it against base_url using urllib.parse.urljoin.
+    """
+    expect_uri = False
+    for raw_line in manifest_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.upper().startswith("#EXT-X-STREAM-INF"):
+            expect_uri = True
+            continue
+        if expect_uri:
+            if line.startswith("#"):
+                continue
+            return urljoin(base_url, line)
+    return None
+
+
+def is_socks_proxy(proxy: str | None) -> bool:
+    """Returns True if proxy URL uses a SOCKS scheme (socks4/socks4a/socks5/socks5h)."""
+    if not proxy:
+        return False
+    return proxy.strip().lower().startswith(("socks4://", "socks4a://", "socks5://", "socks5h://"))
+
+
+def _status_failure_reason(status_code: int, prefix: str = "http") -> str:
+    if 500 <= status_code < 600:
+        return f"{prefix}_5xx"
+    return f"{prefix}_{status_code}"
+
+
 def is_mpegts(chunk: bytes) -> bool:
     """
     Checks for MPEG-TS sync byte 0x47 repeated every 188 bytes across at least 2-3 packets.
@@ -124,6 +159,8 @@ async def _check_single_stream_impl(
     session: aiohttp.ClientSession,
     channel: dict[str, Any],
     timeout_sec: float = 4.0,
+    deep_check: bool = False,
+    proxy: str | None = None,
 ) -> CheckResult:
     url = channel.get("url", "")
     stream_info = {
@@ -165,23 +202,24 @@ async def _check_single_stream_impl(
             connect=timeout_sec * 0.7,
             sock_read=timeout_sec * 0.7,
         )
-        async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as resp:
+        request_kwargs: dict[str, Any] = {
+            "headers": headers,
+            "timeout": timeout,
+            "allow_redirects": True,
+        }
+        clean_proxy = proxy.strip() if isinstance(proxy, str) and proxy.strip() else None
+        if clean_proxy and not is_socks_proxy(clean_proxy):
+            request_kwargs["proxy"] = clean_proxy
+
+        variant_url: str | None = None
+        async with session.get(url, **request_kwargs) as resp:
             status_code = resp.status
             if status_code != 200:
-                if status_code == 403:
-                    reason = "http_403"
-                elif status_code == 404:
-                    reason = "http_404"
-                elif 500 <= status_code < 600:
-                    reason = "http_5xx"
-                else:
-                    reason = f"http_{status_code}"
-
                 return CheckResult(
                     alive=False,
                     latency_ms=0.0,
                     stream_info=stream_info,
-                    reason=reason,
+                    reason=_status_failure_reason(status_code),
                     status_code=status_code,
                 )
 
@@ -225,53 +263,125 @@ async def _check_single_stream_impl(
                 has_extinf = b"#EXTINF" in manifest_bytes
 
                 if has_stream_inf or has_extinf:
-                    try:
-                        text_manifest = manifest_bytes.decode("utf-8", errors="ignore")
+                    text_manifest = manifest_bytes.decode("utf-8", errors="ignore")
+                    with contextlib.suppress(Exception):
                         stream_info = parse_hls_stream_info(text_manifest)
-                    except Exception:
-                        pass
+
+                    if not deep_check or not has_stream_inf:
+                        return CheckResult(
+                            alive=True,
+                            latency_ms=latency_ms,
+                            stream_info=stream_info,
+                            reason="ok",
+                            status_code=status_code,
+                        )
+
+                    final_url = str(getattr(resp, "url", None) or url)
+                    variant_url = extract_hls_variant_url(text_manifest, final_url)
+                else:
                     return CheckResult(
-                        alive=True,
-                        latency_ms=latency_ms,
+                        alive=False,
+                        latency_ms=0.0,
                         stream_info=stream_info,
-                        reason="ok",
+                        reason="empty_hls",
                         status_code=status_code,
                     )
 
+            # HLS media fragment without #EXTM3U, or valid binary media payload
+            elif b"#EXTINF" in chunk or is_valid_media_binary(chunk):
+                return CheckResult(
+                    alive=True,
+                    latency_ms=latency_ms,
+                    stream_info=stream_info,
+                    reason="ok",
+                    status_code=status_code,
+                )
+
+            else:
                 return CheckResult(
                     alive=False,
                     latency_ms=0.0,
                     stream_info=stream_info,
-                    reason="empty_hls",
+                    reason="invalid_binary",
                     status_code=status_code,
                 )
 
-            # HLS segment or media playlist fragment without #EXTM3U
-            if b"#EXTINF" in chunk:
+        # Deep check: verify the extracted HLS variant playlist returns 200 OK
+        if not variant_url:
+            return CheckResult(
+                alive=False,
+                latency_ms=0.0,
+                stream_info=stream_info,
+                reason="empty_hls",
+                status_code=status_code,
+            )
+
+        if not variant_url.startswith(("http://", "https://")):
+            return CheckResult(
+                alive=False,
+                latency_ms=0.0,
+                stream_info=stream_info,
+                reason="unsupported_scheme",
+                status_code=None,
+            )
+
+        async with session.get(variant_url, **request_kwargs) as vresp:
+            vstatus = vresp.status
+            if vstatus != 200:
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason=_status_failure_reason(vstatus, prefix="hls_variant"),
+                    status_code=vstatus,
+                )
+
+            v_ct = vresp.headers.get("Content-Type", "").lower()
+            if "text/html" in v_ct:
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason="hls_variant_html",
+                    status_code=vstatus,
+                )
+
+            vchunk = await vresp.content.read(4096)
+            latency_ms = (time.monotonic() - t0) * 1000
+            if not vchunk:
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason="hls_variant_empty",
+                    status_code=vstatus,
+                )
+
+            lower_vchunk = vchunk.lower()
+            if b"<!doctype html" in lower_vchunk or b"<html" in lower_vchunk:
+                return CheckResult(
+                    alive=False,
+                    latency_ms=0.0,
+                    stream_info=stream_info,
+                    reason="hls_variant_html",
+                    status_code=vstatus,
+                )
+
+            if b"#EXT" in vchunk or is_valid_media_binary(vchunk):
                 return CheckResult(
                     alive=True,
                     latency_ms=latency_ms,
                     stream_info=stream_info,
                     reason="ok",
-                    status_code=status_code,
-                )
-
-            # Valid binary media payload (MPEG-TS, MP4, WebM, FLV, Ogg, ADTS/ID3)
-            if is_valid_media_binary(chunk):
-                return CheckResult(
-                    alive=True,
-                    latency_ms=latency_ms,
-                    stream_info=stream_info,
-                    reason="ok",
-                    status_code=status_code,
+                    status_code=vstatus,
                 )
 
             return CheckResult(
                 alive=False,
                 latency_ms=0.0,
                 stream_info=stream_info,
-                reason="invalid_binary",
-                status_code=status_code,
+                reason="hls_variant_invalid",
+                status_code=vstatus,
             )
 
     except (asyncio.TimeoutError, TimeoutError):
@@ -297,6 +407,8 @@ async def check_single_stream(
     channel: dict[str, Any],
     semaphore: asyncio.Semaphore | None = None,
     timeout_sec: float = 4.0,
+    deep_check: bool = False,
+    proxy: str | None = None,
 ) -> CheckResult:
     """
     Checks if a stream URL is reachable and returns valid media/HLS data.
@@ -304,5 +416,5 @@ async def check_single_stream(
     """
     if semaphore is not None:
         async with semaphore:
-            return await _check_single_stream_impl(session, channel, timeout_sec)
-    return await _check_single_stream_impl(session, channel, timeout_sec)
+            return await _check_single_stream_impl(session, channel, timeout_sec, deep_check=deep_check, proxy=proxy)
+    return await _check_single_stream_impl(session, channel, timeout_sec, deep_check=deep_check, proxy=proxy)

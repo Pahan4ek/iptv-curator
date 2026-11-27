@@ -14,7 +14,7 @@ On a typical run (eng + rus, home connection) it fetches ~3.7k entries, checks ~
 
 1. **Fetch** language playlists from iptv-org, plus any extra M3U URLs or local files from the config.
 2. **Filter** by category, anti-trash keywords (shops, casinos, test cards), blacklist/whitelist and an optional regex.
-3. **Check** every stream with `aiohttp` (40 concurrent requests by default, 4s timeout). Reads only the first 4 KB: rejects HTML error pages served with HTTP 200, accepts HLS playlists, MPEG-TS (0x47 sync byte) and known media content types.
+3. **Check** every stream with `aiohttp` (40 concurrent requests by default, 4s timeout). Reads only the first 4 KB: rejects HTML error pages served with HTTP 200, accepts HLS playlists, MPEG-TS (0x47 sync byte) and known media content types. With `--deep-check`, also fetches one variant playlist from HLS master manifests to catch geo-blocked or expired child streams; `--proxy` / `IPTV_PROXY` routes checker requests through an HTTP or SOCKS proxy.
 4. **Probe quality** by parsing `#EXT-X-STREAM-INF` in HLS master manifests to get the real resolution and bitrate instead of trusting the channel name.
 5. **Deduplicate** by normalized channel name: highest resolution wins, then bitrate, then latency.
 6. **Apply quotas** per language and write the playlist with EPG links, UHD channels on top.
@@ -39,6 +39,8 @@ python iptv_updater.py --profile sports      # sports, 720p+
 python iptv_updater.py --profile kids        # cartoons and kids channels
 python iptv_updater.py --profile news        # news only
 python iptv_updater.py --lang eng --min-res 1080p
+python iptv_updater.py --deep-check            # also verify HLS variant playlists return 200 OK
+python iptv_updater.py --proxy socks5://127.0.0.1:1080  # route stream checks via HTTP/SOCKS proxy
 python iptv_updater.py --no-check            # skip stream checks, fast dry run
 ```
 
@@ -53,6 +55,8 @@ Copy `config.example.json` to `config.json` and edit. The interesting bits:
 | `sources.custom_m3u_urls` / `local_m3u_files` | extra playlists to merge in |
 | `max_channels_per_language` | quota per language after dedup |
 | `max_concurrent_checks` / `stream_check_timeout_seconds` | checker tuning |
+| `deep_check` | verify HLS variant playlists return `200 OK` (default `false`; CLI `--deep-check`) |
+| `proxy` | HTTP/SOCKS proxy URL for stream checks (overridden by `IPTV_PROXY` env var and `--proxy`) |
 
 `config.json` is gitignored.
 
