@@ -19,6 +19,8 @@ from iptv_updater import (  # noqa: E402
     compile_custom_regex,
     get_channel_quality_score,
     is_high_def,
+    mask_proxy_url,
+    parse_args,
     parse_m3u,
     passes_content_filters,
     resolve_config,
@@ -367,3 +369,106 @@ def test_uhd_4k_channels_not_mutated_and_profile_filtering():
 
     # Verify global UHD_4K_CHANNELS snapshot is strictly unchanged
     assert orig_snapshot == UHD_4K_CHANNELS
+
+
+def test_cli_flags_deep_check_and_proxy_priority(monkeypatch):
+    assert DEFAULT_CONFIG["deep_check"] is False
+    assert DEFAULT_CONFIG["proxy"] == ""
+
+    # 1. parse_args supports --deep-check and --proxy
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["iptv_updater.py", "--deep-check", "--proxy", "http://cli-proxy:8080"],
+    )
+    parsed = parse_args()
+    assert parsed.deep_check is True
+    assert parsed.proxy == "http://cli-proxy:8080"
+
+    # 2. Config proxy used when env and CLI are unset
+    monkeypatch.delenv("IPTV_PROXY", raising=False)
+    base_cfg = copy.deepcopy(DEFAULT_CONFIG)
+    base_cfg["proxy"] = "http://cfg-proxy:3128"
+    args_empty = argparse.Namespace(profile=None, deep_check=False, proxy=None)
+    resolved_cfg = resolve_config(base_cfg, args_empty)
+    assert resolved_cfg["deep_check"] is False
+    assert resolved_cfg["proxy"] == "http://cfg-proxy:3128"
+
+    # 3. IPTV_PROXY overrides config.json
+    monkeypatch.setenv("IPTV_PROXY", "socks5://127.0.0.1:1080")
+    resolved_env = resolve_config(base_cfg, args_empty)
+    assert resolved_env["proxy"] == "socks5://127.0.0.1:1080"
+
+    # 4. CLI --proxy overrides IPTV_PROXY and config.json; --deep-check enables deep_check
+    resolved_cli = resolve_config(base_cfg, parsed)
+    assert resolved_cli["deep_check"] is True
+    assert resolved_cli["proxy"] == "http://cli-proxy:8080"
+
+
+def test_check_all_streams_passes_deep_check_and_http_proxy(monkeypatch, capsys):
+    channels = [{"name": "Live 1", "url": "https://stream.example/master.m3u8"}]
+    captured_calls = []
+
+    async def mock_check_single_stream(session, ch, semaphore=None, timeout_sec=4.0, **kwargs):
+        captured_calls.append({"ch": ch, "timeout_sec": timeout_sec, **kwargs})
+        return CheckResult(alive=True, latency_ms=12.0, reason="ok")
+
+    import iptv_updater
+
+    monkeypatch.setattr(iptv_updater, "check_single_stream", mock_check_single_stream)
+
+    cfg = {
+        "max_concurrent_checks": 2,
+        "stream_check_timeout_seconds": 2.0,
+        "deep_check": True,
+        "proxy": "http://proxyuser:supersecret@proxy.example:8080",
+    }
+    alive = asyncio.run(check_all_streams(channels, cfg))
+    assert len(alive) == 1
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["deep_check"] is True
+    assert captured_calls[0]["proxy"] == "http://proxyuser:supersecret@proxy.example:8080"
+
+    out = capsys.readouterr().out
+    assert "deep-check" in out
+    assert "supersecret" not in out
+    assert mask_proxy_url(cfg["proxy"]) == "http://proxyuser:***@proxy.example:8080"
+
+
+def test_check_all_streams_socks_proxy_uses_proxy_connector(monkeypatch):
+    import types
+
+    import iptv_updater
+
+    created_connectors = []
+
+    class FakeProxyConnector(aiohttp.TCPConnector):
+        @classmethod
+        def from_url(cls, url, **kwargs):
+            created_connectors.append((url, kwargs))
+            return cls(**kwargs)
+
+    fake_socks_mod = types.ModuleType("aiohttp_socks")
+    fake_socks_mod.ProxyConnector = FakeProxyConnector
+    monkeypatch.setitem(sys.modules, "aiohttp_socks", fake_socks_mod)
+
+    captured_calls = []
+
+    async def mock_check_single_stream(session, ch, semaphore=None, timeout_sec=4.0, **kwargs):
+        captured_calls.append(kwargs)
+        return CheckResult(alive=True, latency_ms=5.0, reason="ok")
+
+    monkeypatch.setattr(iptv_updater, "check_single_stream", mock_check_single_stream)
+
+    monkeypatch.setenv("IPTV_PROXY", "socks5://127.0.0.1:1080")
+    cfg = {"max_concurrent_checks": 2, "stream_check_timeout_seconds": 1.0}
+    alive = asyncio.run(check_all_streams([{"name": "Ch1", "url": "https://stream.example/1.ts"}], cfg))
+
+    assert len(alive) == 1
+    assert len(created_connectors) == 1
+    assert created_connectors[0][0] == "socks5://127.0.0.1:1080"
+    assert "proxy" not in captured_calls[0]
+
+    # Unsupported proxy scheme fails cleanly
+    with pytest.raises(ValueError, match="Unsupported proxy URL scheme"):
+        asyncio.run(check_all_streams([], {"proxy": "ftp://proxy.example:21"}))
